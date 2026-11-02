@@ -20,7 +20,7 @@ def test_same_organization_different_subscriptions_bill_separately(env):
         ledger.bind(conn, org, device, user)
         syncer._upsert_request(conn, 'a1', item(rid, org, account, device))
     conn.commit()
-    day = date.today()
+    day = billing.today()
     for unit, cost in [('10:seat1', 100), ('10:seat2', 200), ('20:seat1', 300)]:
         billing.add_period(conn, unit, day, day, cost)
     bill = billing.compute(conn, day, day)
@@ -61,7 +61,7 @@ def test_missing_upstream_id_never_uses_login_or_current_subscription(env):
     del old['account_id']
     syncer._upsert_request(rt.conn, 'a1', old)
     rt.conn.commit()
-    day = date.today()
+    day = billing.today()
     billing.add_period(rt.conn, '10:seat1', day, day, 100)
     bill = billing.compute(rt.conn, day, day)
     assert bill['users'] == {}
@@ -91,7 +91,7 @@ def test_overlap_is_per_subscription_not_per_login_or_org(env):
     rt, _ = env
     ledger.ensure_unit(rt.conn, 1, 202)
     rt.conn.commit()
-    day = date.today()
+    day = billing.today()
     billing.add_period(rt.conn, '1:seat1', day, day, 100)
     billing.add_period(rt.conn, '1:seat2', day, day, 200)
     with pytest.raises(ValueError, match='重叠'):
