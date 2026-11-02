@@ -636,8 +636,8 @@ class Bot:
             self.conn.commit()
             billing.add_period(self.conn, aid, start, end, cost)
         except Exception as exc:                 # noqa: BLE001
-            # 半成品回滚：只有在这条账号没有任何租期/流水时才删，避免误删已有数据。
-            self.conn.rollback()
+            # 不调用 conn.rollback()：连接与采集线程共用，回滚会误伤别的线程未提交的写。
+            # 账号行已 commit，这里只删「没有任何租期/流水」的半成品行。
             periods = self.conn.execute(
                 "SELECT COUNT(*) n FROM account_periods WHERE account_id=?", (aid,)).fetchone()["n"]
             reqs = self.conn.execute(

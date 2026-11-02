@@ -52,7 +52,7 @@ def cmd_account_add(args) -> None:
         if start is not None:
             billing.add_period(rt.conn, args.id, start, end, cost)
     except Exception as exc:                     # noqa: BLE001
-        rt.conn.rollback()
+        # 不 rollback：连接可能与其他线程共用，回滚会误伤别的写操作。
         periods = rt.conn.execute(
             "SELECT COUNT(*) n FROM account_periods WHERE account_id=?", (args.id,)).fetchone()["n"]
         reqs = rt.conn.execute(
