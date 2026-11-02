@@ -15,7 +15,7 @@ def parse_date(s: str) -> date:
 
 
 def day_start_ms(d: date) -> int:
-    return int(time.mktime(datetime(d.year, d.month, d.day, 0, 0, 0).timetuple()) * 1000)
+    return int(datetime(d.year, d.month, d.day, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
 
 
 def day_end_ms(d: date) -> int:
@@ -23,7 +23,7 @@ def day_end_ms(d: date) -> int:
 
 
 def today() -> date:
-    return date.today()
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
 
 def month_bounds(d: date) -> tuple[date, date]:
