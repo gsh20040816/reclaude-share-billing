@@ -62,13 +62,13 @@ def test_help_and_accounts(bot):
 def test_account_add_flow_encrypts_and_deletes_password(bot):
     chat = _msg()["chat"]
     bot.command(chat, _msg(), ADMIN, "/account_add", None)
-    for text in ("ops@example.com", "s3cret-pw", "ultra-a", "2026-11-01", "2026-11-30", "2200"):
+    for text in ("ops@example.com", "s3cret-pw", "ultra-a"):
         msg = _msg(text=text)
         bot.handle({"message": msg})
     assert 7 in bot.tg.deleted                                     # 密码消息被删
     row = bot.conn.execute("SELECT * FROM rc_accounts WHERE id='ultra-a'").fetchone()
     assert row is not None and row["password_enc"].startswith("fernet:")
-    assert bot.conn.execute("SELECT cost_cny FROM account_periods WHERE account_id='ultra-a'").fetchone()[0] == 2200
+    assert bot.conn.execute("SELECT COUNT(*) FROM account_periods").fetchone()[0] == 0
 
 
 def test_report_and_rates_render(bot):

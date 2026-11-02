@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import billing, enroll, evictor, store, syncer          # noqa: E402
+from app import billing, enroll, evictor, store, syncer, ledger          # noqa: E402
 from app.runtime import Runtime                                   # noqa: E402
 
 
@@ -20,7 +20,7 @@ class FakeState:
         self.items = []
         self.devices = []
         self.devices_next = None
-        self.quota = {"max": 4, "used": 0, "account_max": 4, "account_used": 0}
+        self.quota = {"max": 4, "used": 0, "account_max": 4, "account_used": 0, "account_org_id": 1}
         self.describe = {"hostname": "test-laptop", "os": "linux", "arch": "amd64",
                          "expires_at": int(time.time() * 1000) + 600_000,
                          "suggested_org_id": 1}
@@ -29,7 +29,7 @@ class FakeState:
     def add_item(self, rid, device_id, cost, model="claude-opus-5-5", status="priced",
                  created_at=None):
         self.items.append({
-            "id": rid, "device_id": device_id, "org_id": 1,
+            "id": rid, "device_id": device_id, "org_id": 1, "account_id": 101,
             "created_at": created_at or (store.now_ms() - 60_000),
             "model": model, "request_kind": "messages", "status": 200, "is_stream": True,
             "duration_ms": 1000, "input_tokens": 100, "output_tokens": 200,
@@ -47,10 +47,12 @@ class FakeClient:
         self.cookie = "rc_sid=fake-cookie"
 
     def get(self, path):
+        if path == "/api/app/orgs/":
+            return {"items": [{"id": 1, "role": "owner", "current_account": {"id": 101, "status": "bound"}}]}
         if path.startswith("/api/app/devices/quota"):
             return self.state.quota
         if path.startswith("/api/app/devices"):
-            return self.state.devices
+            return [dict(d, org_id=d.get("org_id", 1)) for d in self.state.devices]
         if path.startswith("/api/app/usage/stats"):
             return {"overview": {"total_usd": "0", "heatmap": []}}
         raise AssertionError("unexpected GET " + path)
@@ -76,7 +78,7 @@ class FakeClient:
         return {"items": list(self.state.items), "next_cursor": None}
 
     def devices(self):
-        return self.state.devices
+        return [dict(d, org_id=d.get("org_id", 1)) for d in self.state.devices]
 
     def device_quota(self):
         return self.state.quota
@@ -93,14 +95,16 @@ def env(tmp_path):
                     " capacity, created_at) VALUES ('a1','a1','x@y.z','', 'ok',1,4,?)",
                     (store.iso(),))
     rt.conn.commit()
+    ledger.ensure_unit(rt.conn, 1, 101)
+    rt.conn.commit()
     yield rt, state
     rt.close()
 
 
 def test_sync_idempotent_and_attribution(env):
     rt, state = env
-    rt.conn.execute("INSERT INTO devices(account_id, rc_device_id, user_id, name, state, first_seen_at)"
-                    " VALUES ('a1', 100, 111, 'u1', 'active', ?)", (store.iso(),))
+    rt.conn.execute("INSERT INTO devices(account_id, rc_device_id, user_id, name, state, first_seen_at,org_id)"
+                    " VALUES ('a1', 100, 111, 'u1', 'active', ?,1)", (store.iso(),))
     rt.conn.commit()
     for i in range(3):
         state.add_item(1000 + i, 100, 2.0)
@@ -136,16 +140,16 @@ def test_price_backfill(env):
 def test_billing_split_exact_and_multiplier(env):
     rt, _ = env
     today = date.today()
-    billing.add_period(rt.conn, "a1", today - timedelta(days=1), today + timedelta(days=10), 1000.0)
+    billing.add_period(rt.conn, "1:101", today - timedelta(days=1), today + timedelta(days=10), 1000.0)
     rt.conn.execute("INSERT INTO model_rates(pattern, multiplier, updated_at) VALUES ('claude-opus-5-5', 2.0, ?)",
                     (store.iso(),))
     ts = store.now_ms() - 1000
     for rid, uid, usd, model in ((1, 111, 10.0, "claude-haiku-5-5"),
                                  (2, 222, 10.0, "claude-opus-5-5")):
         rt.conn.execute(
-            """INSERT INTO requests(id, account_id, rc_device_id, user_id, created_at, model,
+            """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, user_id, created_at, model,
                                     cost_usd, pricing_status, total_tokens, first_seen_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               VALUES ('1:101',?,?,?,?,?,?,?,?,?,?)""",
             (rid, "a1", 100 + rid, uid, ts, model, usd, "priced", 1000, store.iso()))
     rt.conn.commit()
 
@@ -160,9 +164,9 @@ def test_billing_split_exact_and_multiplier(env):
 def test_period_overlap_rejected(env):
     rt, _ = env
     today = date.today()
-    billing.add_period(rt.conn, "a1", today, today + timedelta(days=30), 2200)
+    billing.add_period(rt.conn, "1:101", today, today + timedelta(days=30), 2200)
     with pytest.raises(ValueError):
-        billing.add_period(rt.conn, "a1", today + timedelta(days=10), today + timedelta(days=40), 2200)
+        billing.add_period(rt.conn, "1:101", today + timedelta(days=10), today + timedelta(days=40), 2200)
 
 
 def test_eviction_respects_min_idle(env):

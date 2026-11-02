@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from . import store
+from . import store, ledger
 from .sessions import serialized_account
 
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_create_5m_tokens",
@@ -31,6 +31,14 @@ def _upsert_devices(conn, account_id: str, devices: list[dict]) -> dict:
                  state=CASE WHEN devices.state='revoked' THEN 'revoked' ELSE 'active' END""",
             (account_id, int(rid), d.get("name"), d.get("sk_prefix"), d.get("org_id"),
              platform, d.get("client_version"), now, d.get("last_used_at")))
+    conn.execute("""INSERT OR IGNORE INTO device_bindings(org_id,rc_device_id,user_id)
+        SELECT org_id,rc_device_id,MIN(user_id) FROM devices
+        WHERE account_id=? AND org_id IS NOT NULL AND user_id IS NOT NULL
+        GROUP BY org_id,rc_device_id HAVING COUNT(DISTINCT user_id)=1""", (account_id,))
+    conn.execute("""UPDATE devices SET user_id=(SELECT user_id FROM device_bindings b
+        WHERE b.org_id=devices.org_id AND b.rc_device_id=devices.rc_device_id)
+        WHERE account_id=? AND EXISTS(SELECT 1 FROM device_bindings b
+        WHERE b.org_id=devices.org_id AND b.rc_device_id=devices.rc_device_id)""", (account_id,))
     # API 里消失的设备：标记 missing（保留 user_id 供归因）。
     # unknown 也要一起判：它只会由历史流水创建，若一直停在 unknown 会永久占名额。
     rows = conn.execute("SELECT rc_device_id FROM devices WHERE account_id=? "
@@ -65,16 +73,13 @@ def _claim_pending_logins(conn, account_id: str) -> int:
         except (ValueError, TypeError, AttributeError):
             continue
         candidates = [d for d in conn.execute(
-            "SELECT rc_device_id FROM devices WHERE account_id=? AND user_id IS NULL "
+            "SELECT rc_device_id,org_id FROM devices WHERE account_id=? AND user_id IS NULL "
             "AND state='active' AND name=?", (account_id, name)).fetchall()
             if d["rc_device_id"] not in before]
         if len(candidates) != 1:
             continue
         did = candidates[0]["rc_device_id"]
-        conn.execute("UPDATE devices SET user_id=? WHERE account_id=? AND rc_device_id=?",
-                     (row["tg_user_id"], account_id, did))
-        conn.execute("UPDATE requests SET user_id=? WHERE account_id=? AND rc_device_id=?",
-                     (row["tg_user_id"], account_id, did))
+        ledger.bind(conn, candidates[0]["org_id"], did, row["tg_user_id"])
         conn.execute("UPDATE login_states SET status='approved', note=? WHERE state=?",
                      (f"device_id={did}", row["state"]))
         store.event(conn, "approve_claimed", account_id=account_id, rc_device_id=did,
@@ -104,7 +109,19 @@ def _upsert_request(conn, account_id: str, item: dict) -> bool:
          *(item.get(f) for f in TOKEN_FIELDS),
          cost, item.get("pricing_status"), item.get("deduction_status"),
          item.get("tracking_id"), store.iso(), store.iso() if cost is not None else None))
-    if cur.rowcount == 1:
+    inserted = cur.rowcount == 1
+    key = None
+    if item.get("org_id") is not None and item.get("account_id") is not None:
+        key = ledger.ensure_unit(conn, item["org_id"], item["account_id"])
+        existing = conn.execute("SELECT billing_unit_id FROM requests WHERE id=?", (int(rid),)).fetchone()
+        if existing["billing_unit_id"] not in (None, key):
+            raise ValueError(f"请求 {rid} 的上游订阅归属冲突")
+        conn.execute("UPDATE requests SET billing_unit_id=?,upstream_account_id=?,org_id=? WHERE id=?",
+                     (key, int(item["account_id"]), int(item["org_id"]), int(rid)))
+    conn.execute("""UPDATE requests SET user_id=COALESCE(user_id,
+        (SELECT user_id FROM device_bindings b WHERE b.org_id=requests.org_id
+         AND b.rc_device_id=requests.rc_device_id)) WHERE id=?""", (int(rid),))
+    if inserted:
         return True
     # 已存在：只在定价状态变化时更新（幂等，不覆盖 user_id）
     conn.execute(
@@ -121,8 +138,8 @@ def _upsert_request(conn, account_id: str, item: dict) -> bool:
 def _attribute(conn, account_id: str, since_ms: int) -> int:
     cur = conn.execute(
         """UPDATE requests SET user_id = (
-                SELECT d.user_id FROM devices d
-                WHERE d.account_id=requests.account_id AND d.rc_device_id=requests.rc_device_id)
+                SELECT b.user_id FROM device_bindings b
+                WHERE b.org_id=requests.org_id AND b.rc_device_id=requests.rc_device_id)
            WHERE user_id IS NULL AND account_id=? AND created_at>=?""",
         (account_id, since_ms))
     conn.commit()
@@ -131,16 +148,23 @@ def _attribute(conn, account_id: str, since_ms: int) -> int:
 
 def _register_unknown_devices(conn, account_id: str, since_ms: int) -> int:
     rows = conn.execute(
-        """SELECT DISTINCT r.rc_device_id, r.id FROM requests r
+        """SELECT DISTINCT r.rc_device_id, r.org_id FROM requests r
            WHERE r.account_id=? AND r.created_at>=? AND r.rc_device_id IS NOT NULL
              AND NOT EXISTS (SELECT 1 FROM devices d
                              WHERE d.account_id=r.account_id AND d.rc_device_id=r.rc_device_id)""",
         (account_id, since_ms)).fetchall()
     for r in rows:
         conn.execute(
-            "INSERT OR IGNORE INTO devices(account_id, rc_device_id, name, state, first_seen_at) "
-            "VALUES (?,?,?,'unknown',?)",
-            (account_id, r["rc_device_id"], f"unknown-{r['rc_device_id']}", store.iso()))
+            "INSERT OR IGNORE INTO devices(account_id, rc_device_id, org_id, name, state, first_seen_at) "
+            "VALUES (?,?,?,?,'unknown',?)",
+            (account_id, r["rc_device_id"], r["org_id"], f"unknown-{r['rc_device_id']}", store.iso()))
+    # Legacy history-only devices had no organization. Fill it only if the
+    # replayed requests agree; never infer a subscription from the current org.
+    conn.execute("""UPDATE devices SET org_id=(SELECT MIN(r.org_id) FROM requests r
+        WHERE r.account_id=devices.account_id AND r.rc_device_id=devices.rc_device_id)
+        WHERE account_id=? AND org_id IS NULL AND
+        (SELECT COUNT(DISTINCT r.org_id) FROM requests r
+         WHERE r.account_id=devices.account_id AND r.rc_device_id=devices.rc_device_id)=1""", (account_id,))
     conn.commit()
     return len(rows)
 
@@ -178,9 +202,7 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                 _upsert_devices(conn, account_id, s.devices())
                 _claim_pending_logins(conn, account_id)
                 quota = s.device_quota()
-                conn.execute("UPDATE rc_accounts SET capacity=? WHERE id=?",
-                             (quota.get("max"), account_id))
-                conn.commit()
+                ledger.discover(conn, account_id, s.get("/api/app/orgs/"), quota)
             except Exception:                     # 设备列表失败不阻塞流水采集
                 conn.rollback()
         cursor = progress["cursor"] if progress else None

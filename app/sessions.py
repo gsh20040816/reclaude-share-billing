@@ -7,7 +7,7 @@ from functools import wraps
 
 import rcapi
 
-from . import crypto, store
+from . import crypto, store, ledger
 
 
 def serialized_account(fn):
@@ -165,23 +165,9 @@ class SessionPool:
             self._relogin(account_id)
             row = store.account_row(self.conn, account_id)
             client = self._clients[account_id]
-            me = client.me()
             orgs = client.orgs()
-            own_org = None
-            for org in (orgs.get("items") or []):
-                acct = org.get("current_account") or {}
-                if acct.get("status") == "bound":
-                    own_org = org.get("id")
-                    break
-            own_org = own_org or orgs.get("default_org_id")
             quota = client.device_quota()
-            self.conn.execute(
-                "UPDATE rc_accounts SET own_org_id=?, tier=?, capacity=?, status='ok', last_error=NULL WHERE id=?",
-                (own_org,
-                 ((me.get("current_account") or {}).get("subscription_type")),
-                 quota.get("max"),
-                 account_id))
-            self.conn.commit()
+            own_org = ledger.discover(self.conn, account_id, orgs, quota)
             self._save_cookie(account_id, client)
-            return {"own_org_id": own_org, "capacity": quota.get("max"),
+            return {"own_org_id": own_org, "capacity": quota.get("account_max", quota.get("max")),
                     "quota": quota, "email": row["email"]}

@@ -24,14 +24,16 @@ def _db(tmp_path):
 
 
 def _account(conn, aid="a1"):
+    from app import ledger
+    ledger.ensure_unit(conn, 1, 101)
     conn.execute("INSERT INTO rc_accounts(id, label, email, status, capacity, created_at)"
                  " VALUES (?,?,?,'ok',4,?)", (aid, aid, "x@y.z", store.iso()))
     conn.commit()
 
 
 def _period(conn, start, end, cost, aid="a1"):
-    conn.execute("INSERT INTO account_periods(account_id, start_date, end_date, cost_cny,"
-                 " idle_split, created_at) VALUES (?,?,?,?,'none',?)",
+    conn.execute("INSERT INTO account_periods(billing_unit_id,account_id, start_date, end_date, cost_cny,"
+                 " idle_split, created_at) VALUES ('1:101',?,?,?,?,'none',?)",
                  (aid, start.isoformat(), end.isoformat(), cost, store.iso()))
     conn.commit()
 
@@ -39,9 +41,9 @@ def _period(conn, start, end, cost, aid="a1"):
 def _req(conn, rid, device, user_id, created_at, cost_usd, status, aid="a1",
          model="claude-haiku-4-5-20251001"):
     conn.execute(
-        """INSERT INTO requests(id, account_id, rc_device_id, user_id, created_at, model,
+        """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, user_id, created_at, model,
                                 cost_usd, pricing_status, total_tokens, first_seen_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+           VALUES ('1:101',?,?,?,?,?,?,?,?,?,?)""",
         (rid, aid, device, user_id, created_at, model, cost_usd, status, 1000, store.iso()))
     conn.commit()
 
@@ -103,13 +105,13 @@ def test_ignored_and_not_billable_excluded_everywhere(tmp_path):
     assert bill["users"][111] == 100.00
 
     s_ms, e_ms = billing.day_start_ms(start), billing.day_end_ms(end)
-    usage = billing.weighted_usage(conn, "a1", s_ms, e_ms)
+    usage = billing.weighted_usage(conn, "1:101", s_ms, e_ms)
     assert usage["unassigned_weighted"] == 0.0
     assert usage["unassigned_requests"] == 0
     assert list(usage["per_user"]) == [111]
     assert usage["per_user"][111]["weighted"] == 1.0
 
-    assert billing.pending_stats(conn, "a1", s_ms, e_ms) == \
+    assert billing.pending_stats(conn, "1:101", s_ms, e_ms) == \
         {"requests": 0, "tokens": 0, "stale": 0}
 
 
@@ -126,30 +128,10 @@ def test_real_data_reconciliation(tmp_path):
         dst.close()
         src.close()
     conn = store.connect(str(db))
-    start, end = date(2026, 10, 27), date(2026, 11, 26)
-
-    bill = billing.compute(conn, start, end)
-
-    unassigned = bill["anomalies"]["unassigned"]
-    total = sum(bill["users"].values()) + sum(a["amount_cny"] for a in unassigned)
-    assert abs(total - 2200.00) <= 0.01
-    # 该库里所有 cost 为空的记录都是 ignored / not_billable，不该报 stale
-    assert bill["anomalies"]["stale"] == []
-
-    # 每台设备的定价美元合计 → 按 devices 归到人，必须与该期个人 raw_usd 对得上
-    s_ms, e_ms = billing.day_start_ms(start), billing.day_end_ms(end)
-    rows = conn.execute(
-        """SELECT d.user_id AS uid, SUM(r.cost_usd) AS usd
-             FROM requests r
-             JOIN devices d ON d.account_id=r.account_id AND d.rc_device_id=r.rc_device_id
-            WHERE r.account_id='mine' AND r.created_at>=? AND r.created_at<=?
-              AND r.cost_usd IS NOT NULL
-              AND COALESCE(r.pricing_status,'') NOT IN ('ignored','not_billable')
-            GROUP BY d.user_id""", (s_ms, e_ms)).fetchall()
-    per_device = {r["uid"]: r["usd"] for r in rows if r["uid"] is not None}
-    assert per_device, "真实库里应有按设备的定价合计"
-    for line in bill["periods"]:
-        if line["user_id"] is None:
-            continue
-        assert abs(per_device.get(line["user_id"], 0.0) - line["raw_usd"]) <= 0.01
+    original_count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    store.init(conn)
+    bill = billing.compute(conn, date(2026, 10, 27), date(2026, 11, 26))
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == original_count
+    assert bill["users"] == {}  # Old export has no upstream account IDs; never guess.
+    assert bill["anomalies"]["legacy_periods"]
     conn.close()

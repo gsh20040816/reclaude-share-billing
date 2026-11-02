@@ -5,7 +5,7 @@ import json
 import secrets
 import time
 
-from . import evictor, store
+from . import evictor, store, ledger
 
 
 class NoSlot(Exception):
@@ -84,7 +84,10 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
         raise NoSlot("所有已启用账号都满员，且没有满足闲置门槛的设备可下线")
 
     info = describe(pool, conn, state, acc["id"])
-    org_id = acc["own_org_id"] or (info.get("suggested_org_id"))
+    with pool.session(acc["id"]) as session:
+        org_id = ledger.discover(conn, acc["id"], session.get("/api/app/orgs/"), session.device_quota())
+    if org_id is None:
+        raise EnrollError("无法确认登录账号的自有组织，停止分配")
     plan = {
         "account_id": acc["id"], "org_id": org_id, "device_name": device_name,
         "hostname": info.get("hostname"), "os": info.get("os"), "arch": info.get("arch"),
@@ -147,11 +150,12 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
 
 def bind_device(conn, account_id: str, rc_device_id: int, user_id: int | None) -> int:
     """把已知 device_id 绑到用户（含已撤销设备的历史归因）。"""
-    cur = conn.execute("UPDATE devices SET user_id=? WHERE account_id=? AND rc_device_id=?",
-                       (user_id, account_id, rc_device_id))
-    conn.execute("UPDATE requests SET user_id=? WHERE account_id=? AND rc_device_id=?",
-                 (user_id, account_id, rc_device_id))
-    if cur.rowcount and user_id is not None:
+    device = conn.execute("SELECT org_id FROM devices WHERE account_id=? AND rc_device_id=?",
+                          (account_id, rc_device_id)).fetchone()
+    if device is None:
+        raise ValueError("找不到设备")
+    ledger.bind(conn, device["org_id"], rc_device_id, user_id)
+    if user_id is not None:
         pending = conn.execute(
             "SELECT state FROM login_states WHERE account_id=? AND tg_user_id=? "
             "AND status IN ('approved_pending_device','needs_binding')",
@@ -161,4 +165,4 @@ def bind_device(conn, account_id: str, rc_device_id: int, user_id: int | None) -
             conn.execute("UPDATE login_states SET status='approved', note=? WHERE state=?",
                          (f"device_id={rc_device_id}", pending[0]["state"]))
     conn.commit()
-    return cur.rowcount or 0
+    return 1

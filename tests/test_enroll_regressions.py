@@ -141,8 +141,8 @@ def test_pending_login_claimed_by_sync(make_rt):
     # 远早于本次 sync 窗口的历史流水：只有 claim 的 UPDATE 才能补上归属
     old_ts = store.now_ms() - 48 * 3_600_000
     rt.conn.execute(
-        """INSERT INTO requests(id, account_id, rc_device_id, created_at, first_seen_at)
-           VALUES (9001, 'a1', 777, ?, ?)""",
+        """INSERT INTO requests(org_id,id, account_id, rc_device_id, created_at, first_seen_at)
+           VALUES (1,9001, 'a1', 777, ?, ?)""",
         (old_ts, store.iso()))
     rt.conn.commit()
 

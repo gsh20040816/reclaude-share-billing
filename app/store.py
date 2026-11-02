@@ -39,6 +39,26 @@ CREATE TABLE IF NOT EXISTS rc_accounts (
   created_at    TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS billing_units (
+  id TEXT PRIMARY KEY,
+  org_id INTEGER NOT NULL,
+  upstream_account_id INTEGER NOT NULL,
+  org_name TEXT,
+  tier TEXT,
+  UNIQUE(org_id, upstream_account_id)
+);
+CREATE TABLE IF NOT EXISTS billing_unit_access (
+  login_account_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  PRIMARY KEY(login_account_id, unit_id)
+);
+CREATE TABLE IF NOT EXISTS device_bindings (
+  org_id INTEGER NOT NULL,
+  rc_device_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  PRIMARY KEY(org_id, rc_device_id)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
   account_id     TEXT NOT NULL,
   rc_device_id   INTEGER NOT NULL,
@@ -204,6 +224,28 @@ def init(conn: sqlite3.Connection) -> None:
     if migrated.rowcount:
         conn.execute("DELETE FROM watermarks")
         conn.execute("DELETE FROM sync_progress")
+    # Additive migration: old costs stay unassigned until explicitly mapped.
+    for table, columns in {
+        "requests": [("upstream_account_id", "INTEGER"), ("billing_unit_id", "TEXT")],
+        "account_periods": [("billing_unit_id", "TEXT")],
+        "invoice_lines": [("billing_unit_id", "TEXT")],
+    }.items():
+        present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_req_unit_time ON requests(billing_unit_id,created_at)")
+    migrated = conn.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES ('subscription_ledger_v1','1')")
+    if migrated.rowcount:
+        conn.execute("DELETE FROM watermarks")
+        conn.execute("DELETE FROM sync_progress")
+        conn.execute("UPDATE rc_accounts SET own_org_id=NULL")
+        conn.execute("UPDATE invoices SET status='legacy'")
+        conn.execute("""INSERT OR IGNORE INTO device_bindings(org_id,rc_device_id,user_id)
+            SELECT org_id,rc_device_id,MIN(user_id) FROM devices
+            WHERE org_id IS NOT NULL AND user_id IS NOT NULL
+            GROUP BY org_id,rc_device_id HAVING COUNT(DISTINCT user_id)=1""")
     conn.commit()
 
 

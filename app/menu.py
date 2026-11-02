@@ -12,7 +12,8 @@ USER_COMMANDS = [
     ("cancel", "取消当前操作"),
 ]
 ADMIN_COMMANDS = [
-    ("accounts", "账号池 · 状态与席位"),
+    ("accounts", "登录账号池 · 状态与席位"),
+    ("units", "计费账号 · 组织下的订阅与成本"),
     ("account_add", "添加账号 · 按提示填写"),
     ("report", "全员账单与待认领费用"),
     ("sync", "立即采集用量"),

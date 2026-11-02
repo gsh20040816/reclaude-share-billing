@@ -162,7 +162,7 @@ class Bot:
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
-            "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
+            "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
             "/account_del": self.cmd_account_del, "/period": self.cmd_period,
             "/periods": self.cmd_periods, "/rate": self.cmd_rate, "/rates": self.cmd_rates,
             "/revoke": self.cmd_revoke, "/bind": self.cmd_bind, "/sync": self.cmd_sync,
@@ -172,7 +172,7 @@ class Bot:
         if handler is None:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
-        if cmd in ("/accounts", "/account_add", "/account_del", "/period", "/periods",
+        if cmd in ("/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
                    "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
                    "/dryrun") \
                 and not self.is_admin(uid):
@@ -196,10 +196,11 @@ class Bot:
                  "• <code>/cancel</code> 取消当前操作"]
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
-                      "• <code>/accounts</code> 账号池状态",
-                      "• <code>/account_add</code> 添加账号（邮箱→密码→租期→成本）",
+                      "• <code>/accounts</code> 登录账号池状态",
+                      "• <code>/units</code> 组织下的计费账号（组织ID:上游账号ID）",
+                      "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
-                      "• <code>/period add &lt;账号&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
+                      "• <code>/period add &lt;组织ID:上游账号ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
                       "• <code>/periods [账号]</code> 租期与成本",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
@@ -251,7 +252,7 @@ class Bot:
             last = time.strftime("%m-%d %H:%M", time.localtime((d["last_used_at"] or 0) / 1000)) \
                 if d["last_used_at"] else "从未"
             lines.append(f"• <code>{d['account_id']}:{d['rc_device_id']}</code> {esc(d['name'])}")
-            lines.append(f"   状态 {d['state']} · 最近使用 {last}")
+            lines.append(f"   组织 {d['org_id'] or '待回补'} · 状态 {d['state']} · 最近使用 {last}")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_bill(self, chat, msg, uid, args, thread) -> None:
@@ -327,29 +328,40 @@ class Bot:
         for a in accs:
             used = enroll.used_slots(self.conn, a["id"])
             cap = a["capacity"] or 4
-            ps = billing.periods(self.conn, a["id"])
-            cur = None
-            today = date.today()
-            for p in ps:
-                if billing.parse_date(p["start_date"]) <= today <= billing.parse_date(p["end_date"]):
-                    cur = p
             wm = self.conn.execute("SELECT last_synced_at FROM watermarks WHERE account_id=?",
                                    (a["id"],)).fetchone()
             synced = time.strftime("%m-%d %H:%M", time.localtime((wm["last_synced_at"] or 0) / 1000)) \
                 if wm and wm["last_synced_at"] else "从未"
             lines.append(f"\n<b>{esc(a['id'])}</b> · {esc(a['label'] or '')} · {esc(a['tier'] or '?')}")
             lines.append(f"• 状态 {a['status']} · 名额 {used}/{cap} · 组织 {a['own_org_id'] or '-'}")
-            lines.append(f"• 租期 {cur['start_date']}~{cur['end_date']} {money(cur['cost_cny'])}"
-                         if cur else "• <b>租期未配置</b>")
+            lines.append("• 成本按订阅账号配置，使用 /units 查看")
             lines.append(f"• 最近采集 {synced}")
             if a["last_error"]:
                 lines.append(f"• ⚠️ {esc(a['last_error'][:120])}")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
+    def cmd_units(self, chat, msg, uid, args, thread) -> None:
+        rows = self.conn.execute("SELECT * FROM billing_units ORDER BY org_id,upstream_account_id").fetchall()
+        lines = ["<b>计费账号（组织ID:上游账号ID）</b>"]
+        for unit in rows:
+            n = self.conn.execute("SELECT COUNT(*) FROM requests WHERE billing_unit_id=?", (unit["id"],)).fetchone()[0]
+            sources = self.conn.execute("SELECT login_account_id FROM billing_unit_access WHERE unit_id=?", (unit["id"],)).fetchall()
+            lines.append(f"• <code>{unit['id']}</code> · {esc(unit['org_name'] or '')} · {esc(unit['tier'] or '?')} · {n} 条")
+            lines.append("  登录入口：" + (", ".join(esc(r[0]) for r in sources) or "历史订阅"))
+            ps = billing.periods(self.conn, unit["id"])
+            for p in ps:
+                lines.append(f"  租期 #{p['id']}：{p['start_date']}~{p['end_date']} {money(p['cost_cny'])}")
+            if not ps:
+                lines.append("  未配置租期成本")
+        if not rows:
+            lines.append("尚未发现订阅账号，请先添加登录账号并 /sync。")
+        lines.append("设置成本：/period add 组织ID:上游账号ID 起 止 金额")
+        self.tg.send(chat["id"], "\n".join(lines), thread)
+
     def cmd_account_add(self, chat, msg, uid, args, thread) -> None:
         self.flows[uid] = {"cmd": "account_add", "step": "email", "data": {}}
         self.tg.send(chat["id"],
-                     "添加账号 1/6：发 <b>邮箱</b>。\n（随时发 /cancel 取消）", thread)
+                     "添加登录账号 1/3：发 <b>邮箱</b>。\n（随时发 /cancel 取消）", thread)
 
     def cmd_account_del(self, chat, msg, uid, args, thread) -> None:
         if not args:
@@ -367,10 +379,17 @@ class Bot:
 
     # ---------------------------------------------------------------- 管理员：租期
     def cmd_period(self, chat, msg, uid, args, thread) -> None:
+        if args and args[0] == "assign":
+            if len(args) != 3:
+                self.tg.send(chat["id"], "用法：/period assign 旧租期ID 组织ID:上游账号ID", thread)
+                return
+            billing.assign_legacy_period(self.conn, int(args[1]), args[2])
+            self.tg.send(chat["id"], "✅ 旧成本已指定到计费账号（未复制费用）。", thread)
+            return
         if not args or args[0] != "add":
             self.tg.send(chat["id"],
-                         "用法：<code>/period add &lt;账号&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>\n"
-                         "例：<code>/period add ultra-a 2026-11-01 2026-11-30 2200</code>", thread)
+                         "用法：<code>/period add &lt;组织ID:上游账号ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>\n"
+                         "例：<code>/period add 25693:7989 2026-11-01 2026-11-30 2200</code>", thread)
             return
         if len(args) < 5:
             self.tg.send(chat["id"], "参数不够。", thread)
@@ -390,13 +409,13 @@ class Bot:
     def cmd_periods(self, chat, msg, uid, args, thread) -> None:
         aid = args[0] if args else None
         rows = billing.periods(self.conn, aid)
-        if not rows:
-            self.tg.send(chat["id"], "没有租期记录。", thread)
-            return
-        lines = ["<b>租期与成本</b>"]
+        lines = ["<b>租期与成本（按计费账号）</b>"]
         for p in rows:
-            lines.append(f"• <code>{p['account_id']}</code> {p['start_date']}~{p['end_date']} "
+            lines.append(f"• #{p['id']} <code>{p['billing_unit_id']}</code> {p['start_date']}~{p['end_date']} "
                          f"{money(p['cost_cny'])} · idle={p['idle_split']}")
+        for p in self.conn.execute("SELECT * FROM account_periods WHERE billing_unit_id IS NULL"):
+            lines.append(f"⚠️ 待指定 #{p['id']} · 原登录 {esc(p['account_id'])} · {p['start_date']}~{p['end_date']} · {money(p['cost_cny'])}")
+        lines.append("旧成本指定：/period assign 旧租期ID 组织ID:上游账号ID")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     # ---------------------------------------------------------------- 管理员：倍率
@@ -532,6 +551,10 @@ class Bot:
             if p["user_id"] is None:
                 lines.append(f"⚠️ <code>{p['account_id']}</code> {p['start']}~{p['end']} {p['note']}")
         an = bill["anomalies"]
+        if an.get("legacy_periods"):
+            lines.append("⚠️ 旧成本尚未指定到订阅账号，请 /periods 查看并 /period assign。")
+        if an.get("unresolved_requests"):
+            lines.append(f"⚠️ {an['unresolved_requests']} 条流水的上游账号归属待回补，暂未计费。")
         if an["incomplete"]:
             lines.append("\n<b>缺租期</b>")
             for x in an["incomplete"]:
@@ -573,7 +596,10 @@ class Bot:
             "SELECT COUNT(*) n FROM requests WHERE cost_usd IS NULL "
             "AND COALESCE(pricing_status,'') NOT IN ('ignored','not_billable')").fetchone()["n"]
         total = self.conn.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
+        unresolved = self.conn.execute("SELECT COUNT(*) FROM requests WHERE billing_unit_id IS NULL").fetchone()[0]
+        legacy = self.conn.execute("SELECT COUNT(*) FROM account_periods WHERE billing_unit_id IS NULL").fetchone()[0]
         lines += ["", f"请求流水 {total} 条 · 未定价 {pend} 条",
+                  f"订阅归属待回补 {unresolved} 条 · 旧成本待指定 {legacy} 期",
                   f"演练模式：{'开' if self.cfg.get('dry_run', True) else '关'}"]
         pending = self.conn.execute(
             "SELECT state, account_id, tg_user_id FROM login_states "
@@ -609,11 +635,8 @@ class Bot:
 
         if flow["cmd"] == "account_add":
             prompts = {
-                "email": ("password", "2/6：发 <b>密码</b>（这条消息我会立即删除）。"),
-                "password": ("label", "3/6：给账号起个 <b>短标签</b>，如 <code>ultra-a</code>。"),
-                "label": ("start", "4/6：租期 <b>开始日期</b>，如 <code>2026-11-01</code>。"),
-                "start": ("end", "5/6：租期 <b>结束日期</b>，如 <code>2026-11-30</code>。"),
-                "end": ("cost", "6/6：该期 <b>总成本</b>（人民币），如 <code>2200</code>。"),
+                "email": ("password", "2/3：发 <b>密码</b>（这条消息我会立即删除）。"),
+                "password": ("label", "3/3：给账号起个 <b>短标签</b>，如 <code>ultra-a</code>。"),
             }
             if step == "password":
                 data["password"] = text
@@ -625,26 +648,13 @@ class Bot:
                 flow["step"] = nxt[0]
                 self.tg.send(chat["id"], nxt[1])
                 return True
-            if step == "cost":
+            if step == "label":
                 return self._finish_account_add(chat, uid, data)
         return False
 
     def _finish_account_add(self, chat, uid, data) -> bool:
         from .crypto import encrypt
         self.flows.pop(uid, None)
-        try:
-            cost = float(data["cost"])
-            start = billing.parse_date(data["start"])
-            end = billing.parse_date(data["end"])
-        except Exception:                        # noqa: BLE001
-            self.tg.send(chat["id"], "❌ 日期或金额格式不对，流程已取消。重发 /account_add。")
-            return True
-        if end < start:
-            self.tg.send(chat["id"], "❌ 结束日期早于开始日期，流程已取消。重发 /account_add。")
-            return True
-        if not (cost >= 0):
-            self.tg.send(chat["id"], "❌ 成本不能为负数，流程已取消。重发 /account_add。")
-            return True
         aid = data["label"].strip()
         if store.account_row(self.conn, aid):
             self.tg.send(chat["id"], f"❌ 账号 <code>{esc(aid)}</code> 已存在。")
@@ -655,7 +665,6 @@ class Bot:
                    VALUES (?,?,?,?, 'ok', ?)""",
                 (aid, aid, data["email"].strip(), encrypt(data["password"]), store.iso()))
             self.conn.commit()
-            billing.add_period(self.conn, aid, start, end, cost)
         except Exception as exc:                 # noqa: BLE001
             # 每线程独立连接，只回滚当前命令；账号行已 commit，另行清理半成品。
             self.conn.rollback()
@@ -671,13 +680,13 @@ class Bot:
                          "重发 /account_add。")
             return True
         store.event(self.conn, "account_add", actor=f"tg:{uid}", account_id=aid,
-                    detail={"email": data["email"], "start": str(start), "end": str(end), "cost": cost})
+                    detail={"email": data["email"]})
         self.tg.send(chat["id"], f"✅ 账号 <code>{esc(aid)}</code> 已加入，正在验证登录…")
         try:
             info = self.pool.login_now(aid)
             self.tg.send(chat["id"],
                          f"✅ 登录成功 · 组织 <code>{info['own_org_id']}</code> · "
-                         f"名额 {info['capacity']} · {esc(info['email'])}")
+                         f"名额 {info['capacity']} · {esc(info['email'])}\n使用 /units 查看计费账号，再用 /period add 配置成本。")
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"⚠️ 已保存，但登录失败：<code>{esc(str(exc)[:200])}</code>\n"
                                      "检查密码/是否开了 MFA，修好后可让管理员重新添加或手工修库。")

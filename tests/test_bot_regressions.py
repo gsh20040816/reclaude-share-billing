@@ -48,6 +48,9 @@ def bot(tmp_path):
     rt.conn.execute("INSERT INTO rc_accounts(id,label,email,password_enc,status,own_org_id,capacity,created_at)"
                     " VALUES ('a1','a1','x@y.z','','ok',1,4,?)", (store.iso(),))
     rt.conn.commit()
+    from app import ledger
+    ledger.ensure_unit(rt.conn, 1, 101)
+    rt.conn.commit()
     b = Bot(rt)
     b.tg = StubTelegram()
     yield b
@@ -78,28 +81,20 @@ def test_health_is_admin_only(bot):
 
 
 # ---------------------------------------------------------------- 2) /account_add 回滚
-def test_account_add_invalid_date_leaves_no_rows(bot):
-    _run_account_add(bot, ADMIN, "ops@example.com", "pw", "bad-date-account",
-                     "2026-11-01", "not-a-date", "2200")
-
-    assert store.account_row(bot.conn, "bad-date-account") is None
-    assert bot.conn.execute("SELECT COUNT(*) n FROM account_periods").fetchone()["n"] == 0
+def test_account_add_does_not_ask_for_cost(bot):
+    bot.command(_msg()["chat"], _msg(), ADMIN, "/account_add", None)
+    for text in ("ops@example.com", "pw", "login-only"):
+        bot.handle({"message": _msg(text=text)})
+    assert store.account_row(bot.conn, "login-only") is not None
+    assert bot.conn.execute("SELECT COUNT(*) FROM account_periods").fetchone()[0] == 0
     assert ADMIN not in bot.flows
-    assert any("格式不对" in s for s in bot.tg.sent)
 
 
-def test_account_add_rolls_back_when_period_insert_fails(bot, monkeypatch):
-    def boom(*args, **kwargs):
-        raise ValueError("与已有租期重叠：2026-11-01 ~ 2026-11-30")
-
-    monkeypatch.setattr(botmod.billing, "add_period", boom)
-    _run_account_add(bot, ADMIN, "ops@example.com", "pw", "half-created",
-                     "2026-11-01", "2026-11-30", "2200")
-
-    assert store.account_row(bot.conn, "half-created") is None
-    assert bot.conn.execute("SELECT COUNT(*) n FROM account_periods").fetchone()["n"] == 0
-    assert ADMIN not in bot.flows
-    assert any("已回滚" in s for s in bot.tg.sent)
+def test_period_rejects_invalid_dates_without_creating_cost(bot):
+    bot.command(_msg()["chat"], _msg(), ADMIN,
+                "/period add 1:101 not-a-date 2026-11-30 2200", None)
+    assert bot.conn.execute("SELECT COUNT(*) FROM account_periods").fetchone()[0] == 0
+    assert "❌" in bot.tg.sent[-1]
 
 
 # ---------------------------------------------------------------- 3) 采集失败告警去抖
@@ -126,23 +121,23 @@ def test_sync_alerts_once_and_recovers(bot):
 # ---------------------------------------------------------------- 4) /report 未定价明细
 def _add_pending_request(conn, rid, created_at):
     conn.execute(
-        """INSERT INTO requests(id, account_id, rc_device_id, created_at, model, cost_usd,
+        """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES (?, 'a1', 100, ?, 'claude-opus-5-5', NULL, 'pending', 100, ?)""",
+           VALUES ('1:101',?, 'a1', 100, ?, 'claude-opus-5-5', NULL, 'pending', 100, ?)""",
         (rid, created_at, store.iso()))
     conn.commit()
 
 
 def test_report_renders_stale_count_suffix(bot):
     today = date.today()
-    billing.add_period(bot.conn, "a1", today - timedelta(days=3), today + timedelta(days=1), 1000.0)
+    billing.add_period(bot.conn, "1:101", today - timedelta(days=3), today + timedelta(days=1), 1000.0)
     now = store.now_ms()
     old = billing.day_start_ms(today - timedelta(days=3))
     # 有定价用量，compute 才会走到 pending 统计（整期零用量的租期会提前 continue）。
     bot.conn.execute(
-        """INSERT INTO requests(id, account_id, rc_device_id, created_at, model, cost_usd,
+        """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES (9000, 'a1', 100, ?, 'claude-opus-5-5', 1.0, 'priced', 100, ?)""",
+           VALUES ('1:101',9000, 'a1', 100, ?, 'claude-opus-5-5', 1.0, 'priced', 100, ?)""",
         (now - 3_600_000, store.iso()))
     _add_pending_request(bot.conn, 9001, old + 3_600_000)
     _add_pending_request(bot.conn, 9002, old + 2 * 3_600_000)
@@ -168,9 +163,9 @@ def test_report_without_stale_key_does_not_crash(bot, monkeypatch):
 # ---------------------------------------------------------------- 5) /health 未定价计数
 def test_health_unpriced_count_excludes_ignored(bot):
     bot.conn.executemany(
-        """INSERT INTO requests(id, account_id, rc_device_id, created_at, model, cost_usd,
+        """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES (?, 'a1', 100, ?, 'claude-opus-5-5', ?, ?, 100, ?)""",
+           VALUES ('1:101',?, 'a1', 100, ?, 'claude-opus-5-5', ?, ?, 100, ?)""",
         [(9101, store.now_ms(), 0.5, "priced", store.iso()),
          (9102, store.now_ms(), None, "ignored", store.iso()),
          (9103, store.now_ms(), None, "pending", store.iso())])
@@ -204,7 +199,7 @@ def test_cli_account_add_invalid_date_leaves_no_row(tmp_path):
     db = str(tmp_path / "cli.db")
     with pytest.raises(SystemExit) as exc:
         cli.cmd_account_add(_cli_args(db, end="not-a-date"))
-    assert "格式" in str(exc.value)
+    assert "登录凭据不配置成本" in str(exc.value)
     _assert_cli_account_absent(db, "cli-a")
 
 
@@ -217,5 +212,5 @@ def test_cli_account_add_rolls_back_when_period_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.billing, "add_period", boom)
     with pytest.raises(SystemExit) as exc:
         cli.cmd_account_add(_cli_args(db))
-    assert "添加账号失败" in str(exc.value)
+    assert "登录凭据不配置成本" in str(exc.value)
     _assert_cli_account_absent(db, "cli-a")

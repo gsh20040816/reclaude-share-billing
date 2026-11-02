@@ -24,24 +24,9 @@ def cmd_account_add(args) -> None:
     rt = _rt(args)
     if store.account_row(rt.conn, args.id):
         sys.exit(f"账号 {args.id} 已存在")
-    start = end = cost = None
     if args.start is not None or args.end is not None or args.cost is not None:
-        if not (args.start and args.end and args.cost):
-            rt.close()
-            sys.exit("--start / --end / --cost 需要同时提供")
-        try:
-            start = billing.parse_date(args.start)
-            end = billing.parse_date(args.end)
-            cost = float(args.cost)
-        except Exception as exc:                 # noqa: BLE001
-            rt.close()
-            sys.exit(f"日期或金额格式不对：{exc}")
-        if end < start:
-            rt.close()
-            sys.exit("结束日期早于开始日期")
-        if not (cost >= 0):
-            rt.close()
-            sys.exit("成本不能为负数")
+        rt.close()
+        sys.exit("登录凭据不配置成本；请使用 units 查看，然后 period-add --unit 组织ID:上游账号ID")
     try:
         rt.conn.execute(
             """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)
@@ -49,8 +34,6 @@ def cmd_account_add(args) -> None:
             (args.id, args.id, args.email, encrypt(args.password) if args.password else "",
              store.iso()))
         rt.conn.commit()
-        if start is not None:
-            billing.add_period(rt.conn, args.id, start, end, cost)
     except Exception as exc:                     # noqa: BLE001
         # 每线程独立连接，回滚不会再影响采集线程。
         rt.conn.rollback()
@@ -79,9 +62,22 @@ def cmd_account_del(args) -> None:
     rt.close()
 
 
+def cmd_units(args):
+    rt = _rt(args)
+    print(json.dumps([dict(r) for r in rt.conn.execute("SELECT * FROM billing_units ORDER BY org_id,upstream_account_id")], ensure_ascii=False, indent=2))
+    rt.close()
+
+
+def cmd_period_assign(args):
+    rt = _rt(args)
+    billing.assign_legacy_period(rt.conn, args.period_id, args.unit)
+    rt.close()
+    print("旧成本已指定到计费账号")
+
+
 def cmd_period_add(args) -> None:
     rt = _rt(args)
-    pid = billing.add_period(rt.conn, args.account, billing.parse_date(args.start),
+    pid = billing.add_period(rt.conn, args.unit, billing.parse_date(args.start),
                              billing.parse_date(args.end), float(args.cost),
                              idle_split=args.idle_split)
     print(f"period #{pid} 已记录")
@@ -196,8 +192,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("account-del"); s.add_argument("--id", required=True)
     s.set_defaults(fn=cmd_account_del)
 
+    s = sub.add_parser("units"); s.set_defaults(fn=cmd_units)
+    s = sub.add_parser("period-assign")
+    s.add_argument("--period-id", type=int, required=True); s.add_argument("--unit", required=True)
+    s.set_defaults(fn=cmd_period_assign)
+
     s = sub.add_parser("period-add")
-    s.add_argument("--account", required=True); s.add_argument("--start", required=True)
+    s.add_argument("--unit", required=True); s.add_argument("--start", required=True)
     s.add_argument("--end", required=True); s.add_argument("--cost", required=True, type=float)
     s.add_argument("--idle-split", default="none", choices=["none", "even"])
     s.set_defaults(fn=cmd_period_add)

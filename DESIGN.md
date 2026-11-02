@@ -2,6 +2,8 @@
 
 版本：v1.1（2026-11-02）
 状态：设计定稿并已实现（见 README 与 `app/`）
+
+**计费模型修订（2026-11-03）**：下文早期按登录账号计费的 schema/伪代码已被实现中的订阅账本替代。唯一计费单元为 `(org_id, upstream_account_id)`，`billing_units.id` 使用 `组织ID:上游账号ID`；`requests.account_id` 仅记录首次采集来源，实际分摊使用 `requests.billing_unit_id`。租期和新账单行均显式记录此单元。旧成本不自动推断，需 `/period assign`；旧流水全量回读补齐 upstream_account_id。组织归属采用 quota.account_org_id 或唯一 owner 角色，不能取第一个 status=bound 的组织。
 形态：Telegram Bot（管理员 / 用户两种角色）+ SQLite + 定时采集器
 
 **已确认的参数**：轮询 5 分钟、`MIN_IDLE` 30 分钟、倍率按模型全局配置、计费为租期成本按加权用量分摊（不加价）、入口只做 Telegram Bot。

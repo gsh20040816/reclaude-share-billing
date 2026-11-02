@@ -44,7 +44,10 @@ cp config.example.json /opt/data/state/reclaude-billing/config.json
 #    填 bot_token（@BotFather 新建 bot）、admin_ids、allowed_chat_ids
 
 # 2) 加账号（交互式也可在 bot 里 /account_add）
-python3 -m app.cli account-add --id ultra-a --email you@example.com --password '***' \
+python3 -m app.cli account-add --id ultra-a --email you@example.com --password '***'
+python3 -m app.cli units
+# 从 units 输出选择组织下的上游订阅账号，不能使用登录标签 ultra-a
+python3 -m app.cli period-add --unit 25693:7989 \
     --start 2026-11-01 --end 2026-11-30 --cost 2200
 
 # 3) 配置模型倍率
@@ -65,10 +68,19 @@ scripts/run_bot.sh
 
 用户：`/login <授权链接>` `/me` `/devices` `/bill [起 止]` `/help`
 
-管理员：`/accounts` `/account_add` `/account_del` `/period add` `/periods` `/rate` `/rates`
+管理员：`/accounts` `/account_add` `/account_del` `/units` `/period add` `/period assign` `/periods` `/rate` `/rates`
 `/revoke <账号:设备id>` `/bind <账号:设备id> <tg_user_id>` `/sync` `/report [起 止] [save]` `/health` `/dryrun on|off`
 
 ## 计费口径
+
+计费单元是 **`组织ID:上游订阅账号ID`**，例如 `25693:7989`；同组织换号或轮换订阅后，新旧账号各有独立租期成本。ReClaude 登录邮箱只是采集凭据，同一订阅可被多个登录账号访问。流水按自身 `org_id` 和上游 `account_id` 归账，按请求 ID 去重，不能按采集者或当前组织绑定的账号猜测归属。
+
+- `/account_add` 只收集邮箱、密码和标签，不再配置成本。
+- `/units` 查看发现的当前及历史订阅账号。
+- `/period add 25693:7989 2026-11-01 2026-11-30 2200` 为明确的订阅配置成本。
+- 升级保留旧租期，但不参与新分摊；先 `/periods` 查看旧租期 ID，再 `/period assign 旧租期ID 25693:7989` 指定归属，费用不会复制。
+- 升级会一次性重置采集水位，从头回读以补齐此前未保存的上游账号 ID；无法从上游恢复归属的流水保持待核对，禁止保存不完整账单。旧账单快照保留并标为 `legacy`，不会当作新口径账单覆盖。
+- `idle_split=even` 仅使用本订阅、本期已归属请求中的用户；不会把登录账号可见的其他订阅设备用户拉来均摊。没有可确认的用户时保留未分摊。
 
 ```
 每条请求     w = cost_usd × multiplier(model)       # 隐藏倍率，按模型全局配置
