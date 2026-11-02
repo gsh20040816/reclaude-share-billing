@@ -101,6 +101,7 @@ class Bot:
                 try:
                     self.handle(upd)
                 except Exception as exc:          # noqa: BLE001
+                    self.conn.rollback()
                     self.reply_error(upd, exc)
 
     def stop(self) -> None:
@@ -290,7 +291,8 @@ class Bot:
             return
         if plan.get("pending"):
             self.tg.send(chat["id"], f"✅ 已批准（账号 <code>{plan['account_id']}</code>），"
-                                     "设备记录稍后自动认领。回终端等 reclaude 完成登录即可。", thread)
+                                     "回终端完成登录即可。设备归属将在 10 分钟内尝试确认；"
+                                     "若仍未登记，请联系管理员核对设备并 /bind。", thread)
         else:
             self.tg.send(chat["id"],
                          f"✅ 已登记\n• 账号 <code>{plan['account_id']}</code>\n"
@@ -561,6 +563,13 @@ class Bot:
         total = self.conn.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
         lines += ["", f"请求流水 {total} 条 · 未定价 {pend} 条",
                   f"演练模式：{'开' if self.cfg.get('dry_run', True) else '关'}"]
+        pending = self.conn.execute(
+            "SELECT state, account_id, tg_user_id FROM login_states "
+            "WHERE status IN ('approved_pending_device','needs_binding')").fetchall()
+        if pending:
+            lines.append("\n<b>待核对设备归属</b>（确认实际设备后使用 /bind）")
+            for row in pending:
+                lines.append(f"• {esc(row['account_id'])} · tg:{row['tg_user_id']}")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_dryrun(self, chat, msg, uid, args, thread) -> None:
@@ -636,8 +645,8 @@ class Bot:
             self.conn.commit()
             billing.add_period(self.conn, aid, start, end, cost)
         except Exception as exc:                 # noqa: BLE001
-            # 不调用 conn.rollback()：连接与采集线程共用，回滚会误伤别的线程未提交的写。
-            # 账号行已 commit，这里只删「没有任何租期/流水」的半成品行。
+            # 每线程独立连接，只回滚当前命令；账号行已 commit，另行清理半成品。
+            self.conn.rollback()
             periods = self.conn.execute(
                 "SELECT COUNT(*) n FROM account_periods WHERE account_id=?", (aid,)).fetchone()["n"]
             reqs = self.conn.execute(
@@ -664,12 +673,19 @@ class Bot:
 
     # ---------------------------------------------------------------- 后台采集
     def sync_loop(self) -> None:
+        try:
+            self._sync_loop()
+        finally:
+            self.conn.close()  # closes only this worker's connection
+
+    def _sync_loop(self) -> None:
         while not self._stop.is_set():
             interval = store.get_int(self.conn, "sync_interval_seconds", 300)
             try:
                 results = syncer.sync_all(self.pool, self.conn)
                 self._handle_sync_results(results)
             except Exception as exc:             # noqa: BLE001
+                self.conn.rollback()
                 self._notify_admins(f"⚠️ 采集循环异常：<code>{esc(str(exc)[:200])}</code>")
             self._stop.wait(interval)
 

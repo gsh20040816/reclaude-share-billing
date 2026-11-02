@@ -1,13 +1,8 @@
-"""开通：用户提交 reclaude login 授权链接 → 选账号 → 批准 → 登记 device_id。
-
-批准后设备通常几秒内出现在账号的设备列表，此时按 (账号, name, user_id IS NULL,
-rc_device_id 不在批准前集合) 精确匹配并绑定。若 max_wait 内设备仍未出现，就写一条
-login_states(status='approved_pending_device', note=JSON{device_name, approved_at_ms})；
-后续 syncer.sync_account 里的 _claim_pending_logins 会在设备出现时自动认领并回填归因。
-"""
+"""批准登录并用每次授权的唯一设备名标记认领；无法确认时保留人工绑定。"""
 from __future__ import annotations
 
 import json
+import secrets
 import time
 
 from . import evictor, store
@@ -79,24 +74,6 @@ def describe(pool, conn, state: str, account_id: str) -> dict:
         return s.post("/api/cli/auth/describe", {"state": state})
 
 
-def _new_device_id(conn, account_id: str, before: set[int], device_name: str) -> int | None:
-    """只认这次批准创建的那台设备：同账号、未绑定、批准前不存在。
-
-    API 返回的 name 不一定等于 approve 传入的 device_name（实测可能被改写成
-    `reclaude on <hostname>`），所以：只有一个新设备时直接认；出现多个才用
-    name 精确匹配消歧。仍有歧义就返回 None，交给 pending 自动认领。
-    """
-    rows = conn.execute(
-        """SELECT rc_device_id, name FROM devices
-           WHERE account_id=? AND user_id IS NULL""", (account_id,)).fetchall()
-    new = {int(r["rc_device_id"]) for r in rows if int(r["rc_device_id"]) not in before}
-    if len(new) == 1:
-        return new.pop()
-    named = {int(r["rc_device_id"]) for r in rows
-             if int(r["rc_device_id"]) in new and (r["name"] or "") == device_name}
-    return named.pop() if len(named) == 1 else None
-
-
 def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
            dry_run: bool = True, preferred_account: str | None = None,
            actor: str | None = None, max_wait: float = 30.0) -> dict:
@@ -123,64 +100,48 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
         store.event(conn, "enroll_dry_run", actor=actor, account_id=acc["id"], detail=plan)
         return plan
 
-    before = {r["rc_device_id"] for r in conn.execute(
-        "SELECT rc_device_id FROM devices WHERE account_id=?", (acc["id"],)).fetchall()}
-    with pool.session(acc["id"]) as s:
-        s.post("/api/cli/auth/approve",
-               {"state": state, "device_name": device_name, "org_id": org_id})
-
-    # 等设备出现并登记
-    new_id = None
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        try:
-            syncer.sync_account(pool, conn, acc["id"], since_ms=store.now_ms() - 5 * 60_000)
-        except Exception:                       # noqa: BLE001
-            pass
-        new_id = _new_device_id(conn, acc["id"], before, device_name)
-        if new_id:
-            break
-        time.sleep(3)
-
-    if new_id is None:
-        # 批准成功但设备还没出现：留一条 login_state（JSON 记录设备名），
-        # 后续采集会调用 _claim_pending_logins 自动认领，不需要管理员手工 /bind。
-        pending_note = json.dumps(
-            {"device_name": device_name, "approved_at_ms": store.now_ms()},
-            ensure_ascii=False)
+    marker = "rcb-" + secrets.token_hex(12)
+    # Keep the authorization marker intact even if a display name is unusually long.
+    assigned_name = f"{marker} {device_name[:32]}"
+    with pool.session(acc["id"]) as session:
+        live = session.devices()
+        syncer._upsert_devices(conn, acc["id"], live)
+        before = [int(d["id"]) for d in live if d.get("id") is not None]
+        approved_at = store.now_ms()
+        session.post("/api/cli/auth/approve",
+                     {"state": state, "device_name": assigned_name, "org_id": org_id})
+        note = json.dumps({"device_name": assigned_name, "marker": marker,
+                           "before_ids": before, "approved_at_ms": approved_at,
+                           "claim_until_ms": approved_at + 10 * 60_000})
         conn.execute(
-            """INSERT INTO login_states(state, tg_user_id, account_id, status, hostname, os, arch,
-                                        client_ip, expires_at, created_at, note)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(state) DO UPDATE SET status=excluded.status, account_id=excluded.account_id,
-                 note=excluded.note""",
-            (state, tg_user_id, acc["id"], "approved_pending_device", info.get("hostname"),
-             info.get("os"), info.get("arch"), info.get("client_ip_masked"),
-             info.get("expires_at"), store.iso(), pending_note))
+            """INSERT INTO login_states(state, tg_user_id, account_id, status, hostname,
+                   os, arch, client_ip, expires_at, created_at, note)
+               VALUES (?,?,?,'approved_pending_device',?,?,?,?,?,?,?)
+               ON CONFLICT(state) DO UPDATE SET tg_user_id=excluded.tg_user_id,
+                 account_id=excluded.account_id, status=excluded.status,
+                 created_at=excluded.created_at, note=excluded.note""",
+            (state, tg_user_id, acc["id"], info.get("hostname"), info.get("os"),
+             info.get("arch"), info.get("client_ip_masked"), info.get("expires_at"),
+             store.iso(), note))
         conn.commit()
-        plan["device_id"] = None
-        plan["pending"] = True
-        store.event(conn, "approve", actor=actor, account_id=acc["id"], user_id=tg_user_id, detail=plan)
-        return plan
 
-    conn.execute(
-        """INSERT INTO devices(account_id, rc_device_id, user_id, name, state, first_seen_at)
-           VALUES (?,?,?,?, 'active', ?)
-           ON CONFLICT(account_id, rc_device_id) DO UPDATE SET user_id=excluded.user_id""",
-        (acc["id"], new_id, tg_user_id, device_name, store.iso()))
-    conn.execute(
-        """INSERT INTO login_states(state, tg_user_id, account_id, status, hostname, os, arch,
-                                    client_ip, expires_at, created_at, note)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(state) DO UPDATE SET status=excluded.status, account_id=excluded.account_id,
-             note=excluded.note""",
-        (state, tg_user_id, acc["id"], "approved", info.get("hostname"), info.get("os"),
-         info.get("arch"), info.get("client_ip_masked"), info.get("expires_at"), store.iso(),
-         f"device_id={new_id}"))
-    conn.commit()
-    plan["device_id"] = new_id
-    store.event(conn, "approve", actor=actor, account_id=acc["id"], rc_device_id=new_id,
-                user_id=tg_user_id, detail=plan)
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        try:
+            # Device discovery must not touch the history watermark.
+            with pool.session(acc["id"]) as session:
+                syncer._upsert_devices(conn, acc["id"], session.devices())
+                syncer._claim_pending_logins(conn, acc["id"])
+        except Exception:
+            conn.rollback()
+        row = conn.execute("SELECT status, note FROM login_states WHERE state=?", (state,)).fetchone()
+        if row["status"] == "approved":
+            plan["device_id"] = int(row["note"].split("=", 1)[1])
+            break
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    plan["pending"] = plan["device_id"] is None
+    store.event(conn, "approve", actor=actor, account_id=acc["id"],
+                rc_device_id=plan["device_id"], user_id=tg_user_id, detail=plan)
     return plan
 
 
@@ -190,5 +151,14 @@ def bind_device(conn, account_id: str, rc_device_id: int, user_id: int | None) -
                        (user_id, account_id, rc_device_id))
     conn.execute("UPDATE requests SET user_id=? WHERE account_id=? AND rc_device_id=?",
                  (user_id, account_id, rc_device_id))
+    if cur.rowcount and user_id is not None:
+        pending = conn.execute(
+            "SELECT state FROM login_states WHERE account_id=? AND tg_user_id=? "
+            "AND status IN ('approved_pending_device','needs_binding')",
+            (account_id, user_id)).fetchall()
+        # Multiple pending authorizations cannot be disambiguated by /bind alone.
+        if len(pending) == 1:
+            conn.execute("UPDATE login_states SET status='approved', note=? WHERE state=?",
+                         (f"device_id={rc_device_id}", pending[0]["state"]))
     conn.commit()
     return cur.rowcount or 0

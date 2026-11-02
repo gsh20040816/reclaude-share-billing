@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from . import store, syncer
+from .sessions import serialized_account
 
 
 class EvictionError(Exception):
@@ -50,6 +51,7 @@ def flush_device(pool, conn, account_id: str, rc_device_id: int) -> dict:
     return out
 
 
+@serialized_account
 def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manual",
           actor: str | None = None, dry_run: bool = True, force: bool = False) -> dict:
     row = conn.execute("SELECT * FROM devices WHERE account_id=? AND rc_device_id=?",
@@ -81,6 +83,8 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
         return plan
 
     try:
+        if not force:
+            _check_live_idle(pool, conn, account_id, rc_device_id)
         with pool.session(account_id) as s:
             s.revoke(rc_device_id)
     except Exception as exc:                     # noqa: BLE001
@@ -105,3 +109,23 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
     except Exception:                            # noqa: BLE001
         pass
     return plan
+
+
+def _check_live_idle(pool, conn, account_id, device_id):
+    """Fail closed if fresh activity cannot be established before automatic revoke."""
+    with pool.session(account_id) as session:
+        devices = session.devices()
+    device = next((d for d in devices if int(d.get("id", -1)) == device_id), None)
+    if device is None:
+        raise EvictionError("设备已不在上游列表，取消自动撤销")
+    last = device.get("last_used_at") or device.get("created_at")
+    if not isinstance(last, (int, float)):
+        raise EvictionError("无法确认设备闲置时间，取消自动撤销")
+    recent = conn.execute("SELECT MAX(created_at) FROM requests WHERE account_id=? AND rc_device_id=?",
+                          (account_id, device_id)).fetchone()[0]
+    last = max(last, recent or 0)
+    conn.execute("UPDATE devices SET last_used_at=? WHERE account_id=? AND rc_device_id=?",
+                 (last, account_id, device_id))
+    conn.commit()
+    if store.now_ms() - last < min_idle_ms(conn):
+        raise EvictionError("设备最近仍有使用，取消自动撤销")

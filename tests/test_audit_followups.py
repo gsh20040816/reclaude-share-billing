@@ -39,29 +39,29 @@ def _device(rc_id, name):
             "machine_summary": {}, "client_platform": "linux"}
 
 
-def test_approve_binds_unique_new_device_when_api_rewrites_name(rt):
-    """API 把 name 改成 `reclaude on <host>` 时，唯一新设备仍应直接绑定。"""
+def test_approve_leaves_rewritten_name_for_manual_binding(rt):
+    """API 把 name 改成 `reclaude on <host>` 时，不能仅凭唯一性绑定。"""
     runtime, state = rt
     state.devices_next = [_device(777, "reclaude on test-host.local·darwin-arm64")]
 
     plan = enroll.enroll(runtime.pool, runtime.conn, state="STATE-REWRITE", tg_user_id=999,
                          device_name="u999@999", dry_run=False, max_wait=0.1)
 
-    assert plan["device_id"] == 777 and plan["pending"] is False
+    assert plan["device_id"] is None and plan["pending"] is True
     row = runtime.conn.execute(
         "SELECT user_id FROM devices WHERE account_id='a1' AND rc_device_id=777").fetchone()
-    assert row["user_id"] == 999
+    assert row["user_id"] is None
 
 
-def test_pending_claim_falls_back_to_time_when_name_rewritten(rt):
-    """pending 写入后设备才出现，且 name 被 API 改写时，按时间窗唯一候选认领。"""
+def test_pending_claim_does_not_guess_when_name_rewritten(rt):
+    """pending 写入后设备才出现，且 name 被 API 改写时，保留人工绑定。"""
     runtime, state = rt
     plan = enroll.enroll(runtime.pool, runtime.conn, state="STATE-LATE", tg_user_id=999,
                          device_name="u999@999", dry_run=False, max_wait=0)
     assert plan["pending"] is True
     note = json.loads(runtime.conn.execute(
         "SELECT note FROM login_states WHERE state='STATE-LATE'").fetchone()["note"])
-    assert note["device_name"] == "u999@999"
+    assert note["device_name"].endswith("u999@999")
 
     runtime.conn.execute(
         "INSERT INTO requests(id, account_id, rc_device_id, created_at, first_seen_at)"
@@ -73,12 +73,12 @@ def test_pending_claim_falls_back_to_time_when_name_rewritten(rt):
 
     dev = runtime.conn.execute(
         "SELECT user_id FROM devices WHERE account_id='a1' AND rc_device_id=777").fetchone()
-    assert dev["user_id"] == 999
+    assert dev["user_id"] is None
     assert runtime.conn.execute(
-        "SELECT user_id FROM requests WHERE id=7001").fetchone()[0] == 999
+        "SELECT user_id FROM requests WHERE id=7001").fetchone()[0] is None
     ls = runtime.conn.execute(
         "SELECT status, note FROM login_states WHERE state='STATE-LATE'").fetchone()
-    assert ls["status"] == "approved" and ls["note"] == "device_id=777"
+    assert ls["status"] == "approved_pending_device"
 
 
 def test_zero_usage_period_still_reports_pending(tmp_path):

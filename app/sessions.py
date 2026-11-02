@@ -3,10 +3,24 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
+from functools import wraps
 
 import rcapi
 
 from . import crypto, store
+
+
+def serialized_account(fn):
+    """Hold the same account lock through reads, API calls and checkpoint writes."""
+    @wraps(fn)
+    def wrapped(pool, conn, account_id, *args, **kwargs):
+        with pool._lock(account_id):
+            try:
+                return fn(pool, conn, account_id, *args, **kwargs)
+            except BaseException:
+                conn.rollback()
+                raise
+    return wrapped
 
 
 class AccountUnavailable(Exception):
@@ -62,7 +76,7 @@ class SessionPool:
     def __init__(self, conn, client_factory=None, base_url: str = rcapi.BASE_DEFAULT):
         self.conn = conn
         self.base_url = base_url
-        self._locks: dict[str, threading.Lock] = {}
+        self._locks: dict[str, threading.RLock] = {}
         self._clients: dict[str, object] = {}
         self._guard = threading.Lock()
         self.client_factory = client_factory or self._default_factory
@@ -71,9 +85,9 @@ class SessionPool:
     def _default_factory(self, account_row):
         return rcapi.RcClient(base_url=self.base_url, cookie=account_row["cookie"])
 
-    def _lock(self, account_id: str) -> threading.Lock:
+    def _lock(self, account_id: str) -> threading.RLock:
         with self._guard:
-            return self._locks.setdefault(account_id, threading.Lock())
+            return self._locks.setdefault(account_id, threading.RLock())
 
     def _client(self, account_row):
         cid = account_row["id"]
@@ -98,6 +112,7 @@ class SessionPool:
                 yield sess
             except BaseException:
                 ok = False
+                self.conn.rollback()
                 raise
             finally:
                 self._save_cookie(account_id, sess.client, ok=ok)
@@ -150,22 +165,23 @@ class SessionPool:
             self._relogin(account_id)
             row = store.account_row(self.conn, account_id)
             client = self._clients[account_id]
-        me = client.me()
-        orgs = client.orgs()
-        own_org = None
-        for org in (orgs.get("items") or []):
-            acct = org.get("current_account") or {}
-            if acct.get("status") == "bound":
-                own_org = org.get("id")
-                break
-        own_org = own_org or orgs.get("default_org_id")
-        quota = client.device_quota()
-        self.conn.execute(
-            "UPDATE rc_accounts SET own_org_id=?, tier=?, capacity=?, status='ok', last_error=NULL WHERE id=?",
-            (own_org,
-             ((me.get("current_account") or {}).get("subscription_type")),
-             quota.get("max"),
-             account_id))
-        self.conn.commit()
-        return {"own_org_id": own_org, "capacity": quota.get("max"),
-                "quota": quota, "email": row["email"]}
+            me = client.me()
+            orgs = client.orgs()
+            own_org = None
+            for org in (orgs.get("items") or []):
+                acct = org.get("current_account") or {}
+                if acct.get("status") == "bound":
+                    own_org = org.get("id")
+                    break
+            own_org = own_org or orgs.get("default_org_id")
+            quota = client.device_quota()
+            self.conn.execute(
+                "UPDATE rc_accounts SET own_org_id=?, tier=?, capacity=?, status='ok', last_error=NULL WHERE id=?",
+                (own_org,
+                 ((me.get("current_account") or {}).get("subscription_type")),
+                 quota.get("max"),
+                 account_id))
+            self.conn.commit()
+            self._save_cookie(account_id, client)
+            return {"own_org_id": own_org, "capacity": quota.get("max"),
+                    "quota": quota, "email": row["email"]}

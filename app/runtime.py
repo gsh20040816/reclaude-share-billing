@@ -43,7 +43,7 @@ class Runtime:
     def __init__(self, db_path: str | None = None, config: dict | None = None,
                  client_factory=None):
         self.cfg = config or load_config()
-        self.conn = store.connect(db_path)
+        self.conn = store.ThreadLocalConnection(db_path)
         store.init(self.conn)
         self.pool = SessionPool(self.conn, client_factory=client_factory,
                                 base_url=self.cfg.get("base_url", "https://www.reclaude.ai"))

@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import threading
 
 DB_PATH = os.environ.get("RC_BILLING_DB", "/opt/data/state/reclaude-billing/billing.db")
 
@@ -93,6 +94,13 @@ CREATE TABLE IF NOT EXISTS watermarks (
   updated_at      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS sync_progress (
+  account_id TEXT PRIMARY KEY,
+  since_ms INTEGER NOT NULL,
+  until_ms INTEGER NOT NULL,
+  cursor TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS login_states (
   state       TEXT PRIMARY KEY,
   tg_user_id  INTEGER NOT NULL,
@@ -178,7 +186,7 @@ DEFAULTS = {
 def connect(path: str | None = None) -> sqlite3.Connection:
     p = path or DB_PATH
     os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-    conn = sqlite3.connect(p, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(p, timeout=30, check_same_thread=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
@@ -244,3 +252,27 @@ def account_row(conn, account_id: str):
 
 def enabled_accounts(conn):
     return conn.execute("SELECT * FROM rc_accounts WHERE enabled=1 ORDER BY id").fetchall()
+
+
+class ThreadLocalConnection:
+    """One SQLite transaction owner per thread; never share commit/rollback state."""
+
+    def __init__(self, path=None):
+        self.path = path or DB_PATH
+        self._local = threading.local()
+
+    def current(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = connect(self.path)
+            self._local.conn = conn
+        return conn
+
+    def __getattr__(self, name):
+        return getattr(self.current(), name)
+
+    def close(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            del self._local.conn

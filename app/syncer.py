@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
 
 from . import store
+from .sessions import serialized_account
 
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_create_5m_tokens",
                 "cache_create_1h_tokens", "cache_read_input_tokens", "total_tokens")
@@ -44,77 +44,41 @@ def _upsert_devices(conn, account_id: str, devices: list[dict]) -> dict:
 
 
 def _claim_pending_logins(conn, account_id: str) -> int:
-    """认领「批准成功但设备出现晚了」的登录：把新设备绑给用户并回填历史流水。
-
-    匹配顺序（只有唯一候选才认领，否则静默等下一轮，幂等）：
-      1) note 里的 device_name 与设备名完全一致 —— 唯一即认；
-      2) API 可能把 name 改写成 `reclaude on <hostname>`，退化为「未绑定且首次出现在
-         pending 写入前 10 分钟内」的唯一设备（批准发生在写入前约 30 秒）。
-    没有候选或有歧义时跳过。
-    """
+    """Only claim a fresh, unique authorization marker, never a time-only match."""
     rows = conn.execute(
-        """SELECT state, tg_user_id, note, created_at FROM login_states
-           WHERE account_id=? AND status='approved_pending_device'""",
+        "SELECT * FROM login_states WHERE account_id=? AND status='approved_pending_device'",
         (account_id,)).fetchall()
-    devices = conn.execute(
-        """SELECT rc_device_id, name, first_seen_at FROM devices
-           WHERE account_id=? AND user_id IS NULL""", (account_id,)).fetchall()
     claimed = 0
     for row in rows:
-        device_name = None
-        approved_at_ms = None
-        note = row["note"]
-        if note:
-            try:
-                parsed = json.loads(note)
-            except (TypeError, ValueError):
-                parsed = None                      # 兼容旧版本写入的纯文本 note
-            if isinstance(parsed, dict):
-                name = parsed.get("device_name")
-                device_name = name if isinstance(name, str) and name else None
-                approved_at_ms = parsed.get("approved_at_ms")
-        floor = None
         try:
-            floor = datetime.fromisoformat(row["created_at"]) - timedelta(minutes=10)
-        except (TypeError, ValueError):
-            pass
-
-        def seen_after(d, floor=floor) -> bool:
-            if floor is None:
-                return False
-            try:
-                return datetime.fromisoformat(d["first_seen_at"]) >= floor
-            except (TypeError, ValueError):
-                return False
-
-        picked = None
-        by_name = [d for d in devices if device_name and (d["name"] or "") == device_name]
-        if len(by_name) == 1:
-            picked = by_name[0]
-        else:
-            by_time = [d for d in devices if seen_after(d)]
-            if len(by_time) == 1:
-                picked = by_time[0]
-        if picked is None:
+            note = json.loads(row["note"] or "{}")
+            expires = note.get("claim_until_ms", 0)
+            if not isinstance(expires, (int, float)) or expires <= store.now_ms():
+                conn.execute("UPDATE login_states SET status='needs_binding' WHERE state=?",
+                             (row["state"],))
+                continue
+            name = note.get("device_name")
+            marker = note.get("marker")
+            before = set(note.get("before_ids", []))
+            if not isinstance(marker, str) or not marker or not name or marker not in name:
+                continue
+        except (ValueError, TypeError, AttributeError):
             continue
-        devices.remove(picked)
-        rc_device_id = int(picked["rc_device_id"])
-        user_id = row["tg_user_id"]
-        conn.execute(
-            "UPDATE devices SET user_id=? WHERE account_id=? AND rc_device_id=?",
-            (user_id, account_id, rc_device_id))
-        conn.execute(
-            "UPDATE requests SET user_id=? WHERE account_id=? AND rc_device_id=?",
-            (user_id, account_id, rc_device_id))
-        conn.execute(
-            """UPDATE login_states SET status='approved', note=?
-               WHERE state=? AND status='approved_pending_device'""",
-            (f"device_id={rc_device_id}", row["state"]))
-        store.event(
-            conn, "approve_claimed", account_id=account_id, rc_device_id=rc_device_id,
-            user_id=user_id,
-            detail={"state": row["state"], "device_name": device_name,
-                    "approved_at_ms": approved_at_ms})
+        candidates = [d for d in conn.execute(
+            "SELECT rc_device_id FROM devices WHERE account_id=? AND user_id IS NULL "
+            "AND state='active' AND name=?", (account_id, name)).fetchall()
+            if d["rc_device_id"] not in before]
+        if len(candidates) != 1:
+            continue
+        did = candidates[0]["rc_device_id"]
+        conn.execute("UPDATE devices SET user_id=? WHERE account_id=? AND rc_device_id=?",
+                     (row["tg_user_id"], account_id, did))
+        conn.execute("UPDATE requests SET user_id=? WHERE account_id=? AND rc_device_id=?",
+                     (row["tg_user_id"], account_id, did))
+        conn.execute("UPDATE login_states SET status='approved', note=? WHERE state=?",
+                     (f"device_id={did}", row["state"]))
+        store.event(conn, "approve_claimed", account_id=account_id, rc_device_id=did,
+                    user_id=row["tg_user_id"], detail={"state": row["state"]})
         claimed += 1
     conn.commit()
     return claimed
@@ -193,11 +157,18 @@ def _window(conn, account_id: str, since_ms=None, until_ms=None) -> tuple[int, i
     return max(0, int(since)), int(now)
 
 
+@serialized_account
 def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                  max_pages: int = 200, device_id: int | None = None) -> dict:
     """拉一轮：设备状态 + 请求流水 + 归因。失败抛 AccountUnavailable/rcapi.RcError。"""
     limit = store.get_int(conn, "history_page_limit", 200)
     since, until = _window(conn, account_id, since_ms, until_ms)
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    full = device_id is None and since_ms is None and until_ms is None
+    progress = conn.execute("SELECT * FROM sync_progress WHERE account_id=?", (account_id,)).fetchone() if full else None
+    if progress:
+        since, until = progress["since_ms"], progress["until_ms"]
     inserted = updated = pages = 0
     max_id = None
     truncated = False
@@ -211,8 +182,8 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                              (quota.get("max"), account_id))
                 conn.commit()
             except Exception:                     # 设备列表失败不阻塞流水采集
-                pass
-        cursor = None
+                conn.rollback()
+        cursor = progress["cursor"] if progress else None
         while pages < max_pages:
             page = s.history(since=since, until=until, cursor=cursor, limit=limit,
                              device_id=device_id)
@@ -229,7 +200,13 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                 max_id = max(max_id or 0, int(rid))
             conn.commit()
             cursor = page.get("next_cursor")
-            if not cursor or not items:
+            if full and cursor:
+                conn.execute("INSERT INTO sync_progress VALUES (?,?,?,?) "
+                             "ON CONFLICT(account_id) DO UPDATE SET since_ms=excluded.since_ms, "
+                             "until_ms=excluded.until_ms, cursor=excluded.cursor",
+                             (account_id, since, until, str(cursor)))
+                conn.commit()
+            if not cursor:
                 break
             if pages >= max_pages:
                 truncated = True
@@ -238,9 +215,9 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
     unknown = _register_unknown_devices(conn, account_id, since)
     # 只有「从现有水位开始的整窗采集」才能推进水位。
     # 显式 since_ms（如登录后只补 5 分钟）只覆盖一小段，推进会把中间未采的流水永久跳过。
-    if device_id is None and since_ms is None:
+    if full:
         if truncated:
-            # 还有下一页却没拉完：水位保持不动，下一轮重拉同一窗口（按 id 幂等）。
+            # 还有下一页却没拉完：水位保持不动，下一轮从持久化 cursor 继续同一固定时间窗。
             # 若这里推进到 until，未拉到的旧页会被永久跳过。
             conn.execute(
                 """INSERT INTO watermarks(account_id, last_synced_at, last_request_id, updated_at)
@@ -254,6 +231,7 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                         detail={"pages": pages, "since": since, "until": until,
                                 "last_request_id": max_id})
         else:
+            conn.execute("DELETE FROM sync_progress WHERE account_id=?", (account_id,))
             conn.execute(
                 """INSERT INTO watermarks(account_id, last_synced_at, last_request_id, updated_at)
                    VALUES (?,?,?,?)
@@ -312,6 +290,7 @@ def sync_all(pool, conn, only: list[str] | None = None) -> list[dict]:
             r["priced_after"] = backfill_prices(pool, conn, acc["id"])
             results.append(r)
         except Exception as exc:                            # noqa: BLE001 - 尽力而为
+            conn.rollback()
             conn.execute("UPDATE rc_accounts SET last_error=? WHERE id=?", (str(exc)[:400], acc["id"]))
             conn.commit()
             store.event(conn, "sync_error", account_id=acc["id"], detail={"error": str(exc)[:500]})

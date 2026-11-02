@@ -61,7 +61,12 @@ class FakeClient:
             return self.state.describe
         if path == "/api/cli/auth/approve":
             if self.state.devices_next is not None:
-                self.state.devices = self.state.devices_next
+                self.state.devices = [dict(d) for d in self.state.devices_next]
+                # Simulate the upstream preserving the requested name on this login's device.
+                original = body["device_name"].split(" ", 1)[-1]
+                for device in self.state.devices:
+                    if device.get("name") == original:
+                        device["name"] = body["device_name"]
             return {"ok": True}
         if path.endswith("/revoke"):
             return {"ok": True}

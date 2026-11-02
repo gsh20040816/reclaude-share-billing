@@ -135,7 +135,7 @@ def test_pending_login_claimed_by_sync(make_rt):
         "SELECT * FROM login_states WHERE state='STATE-PENDING'").fetchone()
     assert ls["status"] == "approved_pending_device"
     note = json.loads(ls["note"])
-    assert note["device_name"] == device_name
+    assert note["device_name"].endswith(device_name)
     assert isinstance(note["approved_at_ms"], int)
 
     # 远早于本次 sync 窗口的历史流水：只有 claim 的 UPDATE 才能补上归属
@@ -146,7 +146,7 @@ def test_pending_login_claimed_by_sync(make_rt):
         (old_ts, store.iso()))
     rt.conn.commit()
 
-    state.devices = [_device_dict(777, device_name)]     # 设备这一刻才出现
+    state.devices = [_device_dict(777, note["device_name"])]     # 设备这一刻才出现
     syncer.sync_account(rt.pool, rt.conn, "a1")
 
     dev = rt.conn.execute(
