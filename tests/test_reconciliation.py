@@ -33,7 +33,7 @@ def _account(conn, aid="a1"):
 
 def _period(conn, start, end, cost, aid="a1"):
     conn.execute("INSERT INTO account_periods(billing_unit_id,account_id, start_date, end_date, cost_cny,"
-                 " idle_split, created_at) VALUES ('1:101',?,?,?,?,'none',?)",
+                 " idle_split, created_at) VALUES ('1:seat1',?,?,?,?,'none',?)",
                  (aid, start.isoformat(), end.isoformat(), cost, store.iso()))
     conn.commit()
 
@@ -43,7 +43,7 @@ def _req(conn, rid, device, user_id, created_at, cost_usd, status, aid="a1",
     conn.execute(
         """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, user_id, created_at, model,
                                 cost_usd, pricing_status, total_tokens, first_seen_at)
-           VALUES ('1:101',?,?,?,?,?,?,?,?,?,?)""",
+           VALUES ('1:seat1',?,?,?,?,?,?,?,?,?,?)""",
         (rid, aid, device, user_id, created_at, model, cost_usd, status, 1000, store.iso()))
     conn.commit()
 
@@ -105,13 +105,13 @@ def test_ignored_and_not_billable_excluded_everywhere(tmp_path):
     assert bill["users"][111] == 100.00
 
     s_ms, e_ms = billing.day_start_ms(start), billing.day_end_ms(end)
-    usage = billing.weighted_usage(conn, "1:101", s_ms, e_ms)
+    usage = billing.weighted_usage(conn, "1:seat1", s_ms, e_ms)
     assert usage["unassigned_weighted"] == 0.0
     assert usage["unassigned_requests"] == 0
     assert list(usage["per_user"]) == [111]
     assert usage["per_user"][111]["weighted"] == 1.0
 
-    assert billing.pending_stats(conn, "1:101", s_ms, e_ms) == \
+    assert billing.pending_stats(conn, "1:seat1", s_ms, e_ms) == \
         {"requests": 0, "tokens": 0, "stale": 0}
 
 

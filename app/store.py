@@ -47,6 +47,28 @@ CREATE TABLE IF NOT EXISTS billing_units (
   tier TEXT,
   UNIQUE(org_id, upstream_account_id)
 );
+CREATE TABLE IF NOT EXISTS upstream_assignments (
+  org_id INTEGER NOT NULL,
+  upstream_account_id INTEGER NOT NULL,
+  unit_id TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  PRIMARY KEY(org_id, upstream_account_id)
+);
+CREATE TABLE IF NOT EXISTS org_subscriptions (
+  org_id INTEGER PRIMARY KEY,
+  seat_count INTEGER,
+  expires_at INTEGER,
+  observed_at TEXT NOT NULL,
+  ever_multi INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS subscription_observations (
+  id INTEGER PRIMARY KEY,
+  org_id INTEGER NOT NULL,
+  expires_at INTEGER,
+  upstream_account_id INTEGER,
+  seat_count INTEGER,
+  observed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS billing_unit_access (
   login_account_id TEXT NOT NULL,
   unit_id TEXT NOT NULL,
@@ -246,6 +268,22 @@ def init(conn: sqlite3.Connection) -> None:
             SELECT org_id,rc_device_id,MIN(user_id) FROM devices
             WHERE org_id IS NOT NULL AND user_id IS NOT NULL
             GROUP BY org_id,rc_device_id HAVING COUNT(DISTINCT user_id)=1""")
+    migrated = conn.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES ('stable_seats_v1','1')")
+    if migrated.rowcount:
+        counts = {}
+        for row in conn.execute('SELECT * FROM billing_units ORDER BY org_id,id').fetchall():
+            org = row['org_id']
+            counts[org] = counts.get(org, 0) + 1
+            key = f"{org}:seat{counts[org]}"
+            old = row['id']
+            conn.execute('UPDATE billing_units SET id=? WHERE id=?', (key, old))
+            conn.execute('INSERT OR IGNORE INTO upstream_assignments VALUES (?,?,?,?)',
+                         (org, row['upstream_account_id'], key, iso()))
+            for table in ('requests', 'account_periods', 'invoice_lines'):
+                conn.execute(f'UPDATE {table} SET billing_unit_id=? WHERE billing_unit_id=?', (key, old))
+            conn.execute('UPDATE account_periods SET account_id=? WHERE account_id=?', (key, old))
+            conn.execute('UPDATE billing_unit_access SET unit_id=? WHERE unit_id=?', (key, old))
     conn.commit()
 
 

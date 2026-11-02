@@ -65,7 +65,7 @@ def test_pending_claim_does_not_guess_when_name_rewritten(rt):
 
     runtime.conn.execute(
         "INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, first_seen_at)"
-        " VALUES ('1:101',7001, 'a1', 777, ?, ?)", (store.now_ms() - 3600_000, store.iso()))
+        " VALUES ('1:seat1',7001, 'a1', 777, ?, ?)", (store.now_ms() - 3600_000, store.iso()))
     runtime.conn.commit()
 
     state.devices = [_device(777, "reclaude on test-host.local·darwin-arm64")]
@@ -91,12 +91,12 @@ def test_zero_usage_period_still_reports_pending(tmp_path):
     ledger.ensure_unit(conn, 1, 101)
     start, end = date.today() - timedelta(days=1), date.today() + timedelta(days=1)
     conn.execute("INSERT INTO account_periods(billing_unit_id,account_id, start_date, end_date, cost_cny,"
-                 " idle_split, created_at) VALUES ('1:101','a1',?,?,100.0,'none',?)",
+                 " idle_split, created_at) VALUES ('1:seat1','a1',?,?,100.0,'none',?)",
                  (start.isoformat(), end.isoformat(), store.iso()))
     conn.execute(
         """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES ('1:101',1, 'a1', 9001, ?, 'm', NULL, 'pending', 100, ?)""",
+           VALUES ('1:seat1',1, 'a1', 9001, ?, 'm', NULL, 'pending', 100, ?)""",
         (store.now_ms() - 60_000, store.iso()))
     conn.commit()
 

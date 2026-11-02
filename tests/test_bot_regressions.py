@@ -92,7 +92,7 @@ def test_account_add_does_not_ask_for_cost(bot):
 
 def test_period_rejects_invalid_dates_without_creating_cost(bot):
     bot.command(_msg()["chat"], _msg(), ADMIN,
-                "/period add 1:101 not-a-date 2026-11-30 2200", None)
+                "/period add 1:seat1 not-a-date 2026-11-30 2200", None)
     assert bot.conn.execute("SELECT COUNT(*) FROM account_periods").fetchone()[0] == 0
     assert "❌" in bot.tg.sent[-1]
 
@@ -123,21 +123,21 @@ def _add_pending_request(conn, rid, created_at):
     conn.execute(
         """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES ('1:101',?, 'a1', 100, ?, 'claude-opus-5-5', NULL, 'pending', 100, ?)""",
+           VALUES ('1:seat1',?, 'a1', 100, ?, 'claude-opus-5-5', NULL, 'pending', 100, ?)""",
         (rid, created_at, store.iso()))
     conn.commit()
 
 
 def test_report_renders_stale_count_suffix(bot):
     today = date.today()
-    billing.add_period(bot.conn, "1:101", today - timedelta(days=3), today + timedelta(days=1), 1000.0)
+    billing.add_period(bot.conn, "1:seat1", today - timedelta(days=3), today + timedelta(days=1), 1000.0)
     now = store.now_ms()
     old = billing.day_start_ms(today - timedelta(days=3))
     # 有定价用量，compute 才会走到 pending 统计（整期零用量的租期会提前 continue）。
     bot.conn.execute(
         """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES ('1:101',9000, 'a1', 100, ?, 'claude-opus-5-5', 1.0, 'priced', 100, ?)""",
+           VALUES ('1:seat1',9000, 'a1', 100, ?, 'claude-opus-5-5', 1.0, 'priced', 100, ?)""",
         (now - 3_600_000, store.iso()))
     _add_pending_request(bot.conn, 9001, old + 3_600_000)
     _add_pending_request(bot.conn, 9002, old + 2 * 3_600_000)
@@ -165,7 +165,7 @@ def test_health_unpriced_count_excludes_ignored(bot):
     bot.conn.executemany(
         """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, model, cost_usd,
                                 pricing_status, total_tokens, first_seen_at)
-           VALUES ('1:101',?, 'a1', 100, ?, 'claude-opus-5-5', ?, ?, 100, ?)""",
+           VALUES ('1:seat1',?, 'a1', 100, ?, 'claude-opus-5-5', ?, ?, 100, ?)""",
         [(9101, store.now_ms(), 0.5, "priced", store.iso()),
          (9102, store.now_ms(), None, "ignored", store.iso()),
          (9103, store.now_ms(), None, "pending", store.iso())])

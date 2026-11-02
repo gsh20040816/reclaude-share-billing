@@ -140,7 +140,7 @@ def test_price_backfill(env):
 def test_billing_split_exact_and_multiplier(env):
     rt, _ = env
     today = date.today()
-    billing.add_period(rt.conn, "1:101", today - timedelta(days=1), today + timedelta(days=10), 1000.0)
+    billing.add_period(rt.conn, "1:seat1", today - timedelta(days=1), today + timedelta(days=10), 1000.0)
     rt.conn.execute("INSERT INTO model_rates(pattern, multiplier, updated_at) VALUES ('claude-opus-5-5', 2.0, ?)",
                     (store.iso(),))
     ts = store.now_ms() - 1000
@@ -149,7 +149,7 @@ def test_billing_split_exact_and_multiplier(env):
         rt.conn.execute(
             """INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, user_id, created_at, model,
                                     cost_usd, pricing_status, total_tokens, first_seen_at)
-               VALUES ('1:101',?,?,?,?,?,?,?,?,?,?)""",
+               VALUES ('1:seat1',?,?,?,?,?,?,?,?,?,?)""",
             (rid, "a1", 100 + rid, uid, ts, model, usd, "priced", 1000, store.iso()))
     rt.conn.commit()
 
@@ -164,9 +164,9 @@ def test_billing_split_exact_and_multiplier(env):
 def test_period_overlap_rejected(env):
     rt, _ = env
     today = date.today()
-    billing.add_period(rt.conn, "1:101", today, today + timedelta(days=30), 2200)
+    billing.add_period(rt.conn, "1:seat1", today, today + timedelta(days=30), 2200)
     with pytest.raises(ValueError):
-        billing.add_period(rt.conn, "1:101", today + timedelta(days=10), today + timedelta(days=40), 2200)
+        billing.add_period(rt.conn, "1:seat1", today + timedelta(days=10), today + timedelta(days=40), 2200)
 
 
 def test_eviction_respects_min_idle(env):

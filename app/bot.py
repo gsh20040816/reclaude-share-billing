@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from datetime import date
 
-from . import billing, enroll, evictor, store, syncer
+from . import billing, enroll, evictor, store, syncer, ledger
 from .runtime import Runtime
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -162,7 +162,7 @@ class Bot:
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
-            "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
+            "/unit_link": self.cmd_unit_link, "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
             "/account_del": self.cmd_account_del, "/period": self.cmd_period,
             "/periods": self.cmd_periods, "/rate": self.cmd_rate, "/rates": self.cmd_rates,
             "/revoke": self.cmd_revoke, "/bind": self.cmd_bind, "/sync": self.cmd_sync,
@@ -172,7 +172,7 @@ class Bot:
         if handler is None:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
-        if cmd in ("/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
+        if cmd in ("/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
                    "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
                    "/dryrun") \
                 and not self.is_admin(uid):
@@ -197,10 +197,10 @@ class Bot:
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
                       "• <code>/accounts</code> 登录账号池状态",
-                      "• <code>/units</code> 组织下的计费账号（组织ID:上游账号ID）",
+                      "• <code>/units</code> 组织下的计费账号（计费单元ID）",
                       "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
-                      "• <code>/period add &lt;组织ID:上游账号ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
+                      "• <code>/period add &lt;计费单元ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
                       "• <code>/periods [账号]</code> 租期与成本",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
@@ -340,22 +340,40 @@ class Bot:
                 lines.append(f"• ⚠️ {esc(a['last_error'][:120])}")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
+    def cmd_unit_link(self, chat, msg, uid, args, thread):
+        if len(args) != 2:
+            raise ValueError('用法：/unit_link 计费单元ID 上游账号ID')
+        ledger.link_account(self.conn, args[0], int(args[1]))
+        self.conn.commit()
+        self.tg.send(chat['id'], '已关联到同一席位，保留原成本和历史流水。', thread)
+
     def cmd_units(self, chat, msg, uid, args, thread) -> None:
         rows = self.conn.execute("SELECT * FROM billing_units ORDER BY org_id,upstream_account_id").fetchall()
-        lines = ["<b>计费账号（组织ID:上游账号ID）</b>"]
+        lines = ["<b>计费账号（计费单元ID）</b>"]
         for unit in rows:
             n = self.conn.execute("SELECT COUNT(*) FROM requests WHERE billing_unit_id=?", (unit["id"],)).fetchone()[0]
             sources = self.conn.execute("SELECT login_account_id FROM billing_unit_access WHERE unit_id=?", (unit["id"],)).fetchall()
             lines.append(f"• <code>{unit['id']}</code> · {esc(unit['org_name'] or '')} · {esc(unit['tier'] or '?')} · {n} 条")
             lines.append("  登录入口：" + (", ".join(esc(r[0]) for r in sources) or "历史订阅"))
+            sub = self.conn.execute('SELECT * FROM org_subscriptions WHERE org_id=?', (unit['org_id'],)).fetchone()
+            if sub and sub['expires_at']:
+                lines.append(f"  上游到期：{store.iso(sub['expires_at'])}（自动观测）")
+                lines.append("  开始日期待核实；到期延长不自动新增成本或修改已配置租期")
+            aliases = self.conn.execute('SELECT upstream_account_id FROM upstream_assignments WHERE unit_id=?', (unit['id'],)).fetchall()
+            lines.append("  历史上游账号：" + ', '.join(str(r[0]) for r in aliases))
             ps = billing.periods(self.conn, unit["id"])
             for p in ps:
                 lines.append(f"  租期 #{p['id']}：{p['start_date']}~{p['end_date']} {money(p['cost_cny'])}")
             if not ps:
                 lines.append("  未配置租期成本")
+        pending = self.conn.execute('SELECT org_id,upstream_account_id,COUNT(*) FROM requests '
+                                    'WHERE billing_unit_id IS NULL GROUP BY org_id,upstream_account_id').fetchall()
+        for org_id, upstream_id, count in pending:
+            lines.append(f"  ⚠️ 待核对：组织 {org_id} / 上游账号 {upstream_id}，{count} 条")
         if not rows:
             lines.append("尚未发现订阅账号，请先添加登录账号并 /sync。")
-        lines.append("设置成本：/period add 组织ID:上游账号ID 起 止 金额")
+        lines.append("多席位换号或历史归属待核对：/unit_link 计费单元ID 上游账号ID")
+        lines.append("设置成本：/period add 计费单元ID 起 止 金额")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_account_add(self, chat, msg, uid, args, thread) -> None:
@@ -381,15 +399,15 @@ class Bot:
     def cmd_period(self, chat, msg, uid, args, thread) -> None:
         if args and args[0] == "assign":
             if len(args) != 3:
-                self.tg.send(chat["id"], "用法：/period assign 旧租期ID 组织ID:上游账号ID", thread)
+                self.tg.send(chat["id"], "用法：/period assign 旧租期ID 计费单元ID", thread)
                 return
             billing.assign_legacy_period(self.conn, int(args[1]), args[2])
             self.tg.send(chat["id"], "✅ 旧成本已指定到计费账号（未复制费用）。", thread)
             return
         if not args or args[0] != "add":
             self.tg.send(chat["id"],
-                         "用法：<code>/period add &lt;组织ID:上游账号ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>\n"
-                         "例：<code>/period add 25693:7989 2026-11-01 2026-11-30 2200</code>", thread)
+                         "用法：<code>/period add &lt;计费单元ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>\n"
+                         "例：<code>/period add 25693:seat1 2026-11-01 2026-11-30 2200</code>", thread)
             return
         if len(args) < 5:
             self.tg.send(chat["id"], "参数不够。", thread)
@@ -415,7 +433,7 @@ class Bot:
                          f"{money(p['cost_cny'])} · idle={p['idle_split']}")
         for p in self.conn.execute("SELECT * FROM account_periods WHERE billing_unit_id IS NULL"):
             lines.append(f"⚠️ 待指定 #{p['id']} · 原登录 {esc(p['account_id'])} · {p['start_date']}~{p['end_date']} · {money(p['cost_cny'])}")
-        lines.append("旧成本指定：/period assign 旧租期ID 组织ID:上游账号ID")
+        lines.append("旧成本指定：/period assign 旧租期ID 计费单元ID")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     # ---------------------------------------------------------------- 管理员：倍率

@@ -21,13 +21,13 @@ def test_same_organization_different_subscriptions_bill_separately(env):
         syncer._upsert_request(conn, 'a1', item(rid, org, account, device))
     conn.commit()
     day = date.today()
-    for unit, cost in [('10:101', 100), ('10:202', 200), ('20:101', 300)]:
+    for unit, cost in [('10:seat1', 100), ('10:seat2', 200), ('20:seat1', 300)]:
         billing.add_period(conn, unit, day, day, cost)
     bill = billing.compute(conn, day, day)
     assert bill['users'] == {111: 100, 222: 200, 333: 300}
-    assert {l['billing_unit_id'] for l in bill['periods']} == {'10:101','10:202','20:101'}
+    assert {l['billing_unit_id'] for l in bill['periods']} == {'10:seat1','10:seat2','20:seat1'}
     billing.create_invoices(conn, bill)
-    assert {r[0] for r in conn.execute('SELECT billing_unit_id FROM invoice_lines')} == {'10:101','10:202','20:101'}
+    assert {r[0] for r in conn.execute('SELECT billing_unit_id FROM invoice_lines')} == {'10:seat1','10:seat2','20:seat1'}
 
 
 def test_shared_org_request_deduplicates_across_login_sources(env):
@@ -37,7 +37,7 @@ def test_shared_org_request_deduplicates_across_login_sources(env):
     assert not syncer._upsert_request(rt.conn, 'second-login', request)
     rt.conn.commit()
     row = rt.conn.execute('SELECT * FROM requests').fetchone()
-    assert row['billing_unit_id'] == '10:101'
+    assert row['billing_unit_id'] == '10:seat1'
     assert row['upstream_account_id'] == 101
     assert row['account_id'] == 'a1'  # acquisition source, not the billing unit
     assert rt.conn.execute('SELECT COUNT(*) FROM requests').fetchone()[0] == 1
@@ -51,7 +51,7 @@ def test_legacy_replay_enriches_existing_request_without_losing_user(env):
     rt.conn.execute('UPDATE requests SET user_id=111 WHERE id=1')
     assert not syncer._upsert_request(rt.conn, 'second', item(1, 10, 101))
     row = rt.conn.execute('SELECT billing_unit_id,user_id FROM requests').fetchone()
-    assert tuple(row) == ('10:101',111)
+    assert tuple(row) == ('10:seat1',111)
 
 
 def test_missing_upstream_id_never_uses_login_or_current_subscription(env):
@@ -62,7 +62,7 @@ def test_missing_upstream_id_never_uses_login_or_current_subscription(env):
     syncer._upsert_request(rt.conn, 'a1', old)
     rt.conn.commit()
     day = date.today()
-    billing.add_period(rt.conn, '10:101', day, day, 100)
+    billing.add_period(rt.conn, '10:seat1', day, day, 100)
     bill = billing.compute(rt.conn, day, day)
     assert bill['users'] == {}
     assert bill['anomalies']['unresolved_requests'] == 1
@@ -80,11 +80,11 @@ def test_legacy_cost_requires_explicit_assignment(env):
     with pytest.raises(ValueError, match='旧成本'):
         billing.create_invoices(rt.conn, bill)
     pid = bill['anomalies']['legacy_periods'][0]['id']
-    billing.assign_legacy_period(rt.conn, pid, '1:101')
-    assert billing.periods(rt.conn, '1:101')[0]['cost_cny'] == 2200
+    billing.assign_legacy_period(rt.conn, pid, '1:seat1')
+    assert billing.periods(rt.conn, '1:seat1')[0]['cost_cny'] == 2200
     assert rt.conn.execute('SELECT COUNT(*) FROM account_periods').fetchone()[0] == 1
     with pytest.raises(ValueError):
-        billing.assign_legacy_period(rt.conn, pid, '1:101')
+        billing.assign_legacy_period(rt.conn, pid, '1:seat1')
 
 
 def test_overlap_is_per_subscription_not_per_login_or_org(env):
@@ -92,10 +92,10 @@ def test_overlap_is_per_subscription_not_per_login_or_org(env):
     ledger.ensure_unit(rt.conn, 1, 202)
     rt.conn.commit()
     day = date.today()
-    billing.add_period(rt.conn, '1:101', day, day, 100)
-    billing.add_period(rt.conn, '1:202', day, day, 200)
+    billing.add_period(rt.conn, '1:seat1', day, day, 100)
+    billing.add_period(rt.conn, '1:seat2', day, day, 200)
     with pytest.raises(ValueError, match='重叠'):
-        billing.add_period(rt.conn, '1:101', day, day+timedelta(days=1), 300)
+        billing.add_period(rt.conn, '1:seat1', day, day+timedelta(days=1), 300)
     with pytest.raises(ValueError, match='登录标签'):
         billing.add_period(rt.conn, 'a1', day, day, 100)
 
@@ -108,7 +108,7 @@ def test_own_org_selected_by_quota_not_first_bound_subscription(env):
     assert ledger.discover(rt.conn, 'a1', orgs, {'account_org_id':25693,'account_max':4}) == 25693
     row = store.account_row(rt.conn, 'a1')
     assert row['own_org_id'] == 25693 and row['tier'] == 'max_5x'
-    assert {r[0] for r in rt.conn.execute('SELECT unit_id FROM billing_unit_access')} == {'424253:8858','25693:7989'}
+    assert {r[0] for r in rt.conn.execute('SELECT unit_id FROM billing_unit_access')} == {'424253:seat1','25693:seat1'}
 
 
 def test_device_binding_applies_to_shared_sources_but_not_other_org(env):
@@ -148,9 +148,9 @@ def test_bot_exposes_unit_costs_and_protects_admin_commands(bot):
     bot.conn.commit()
     chat = _msg()['chat']
     bot.command(chat, _msg(), ADMIN, '/units', None)
-    assert '25693:7989' in bot.tg.sent[-1]
-    bot.command(chat, _msg(), ADMIN, '/period add 25693:7989 2026-11-01 2026-11-30 100', None)
-    assert billing.periods(bot.conn, '25693:7989')[0]['cost_cny'] == 100
+    assert '25693:seat1' in bot.tg.sent[-1]
+    bot.command(chat, _msg(), ADMIN, '/period add 25693:seat1 2026-11-01 2026-11-30 100', None)
+    assert billing.periods(bot.conn, '25693:seat1')[0]['cost_cny'] == 100
     bot.command(chat, _msg(), ADMIN, '/period add a1 2026-12-01 2026-12-31 100', None)
     assert '登录标签' in bot.tg.sent[-1]
     bot.command(_msg(uid=555)['chat'], _msg(uid=555), 555, '/units', None)
@@ -159,6 +159,6 @@ def test_bot_exposes_unit_costs_and_protects_admin_commands(bot):
 
 def test_cli_cost_target_is_subscription_key():
     from app.cli import build_parser
-    args = build_parser().parse_args(['period-add', '--unit', '25693:7989',
+    args = build_parser().parse_args(['period-add', '--unit', '25693:seat1',
         '--start', '2026-11-01', '--end', '2026-11-30', '--cost', '100'])
-    assert args.unit == '25693:7989'
+    assert args.unit == '25693:seat1'

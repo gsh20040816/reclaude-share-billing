@@ -26,7 +26,7 @@ def cmd_account_add(args) -> None:
         sys.exit(f"账号 {args.id} 已存在")
     if args.start is not None or args.end is not None or args.cost is not None:
         rt.close()
-        sys.exit("登录凭据不配置成本；请使用 units 查看，然后 period-add --unit 组织ID:上游账号ID")
+        sys.exit("登录凭据不配置成本；请使用 units 查看，然后 period-add --unit 计费单元ID")
     try:
         rt.conn.execute(
             """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)

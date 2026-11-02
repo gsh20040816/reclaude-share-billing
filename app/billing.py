@@ -125,7 +125,7 @@ def period_overlaps(p, start: date, end: date) -> bool:
 def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
                idle_split: str = "none", note: str | None = None) -> int:
     if not conn.execute("SELECT 1 FROM billing_units WHERE id=?", (account_id,)).fetchone():
-        raise ValueError("请使用已发现的 组织ID:上游账号ID（/units 查看），不能使用登录标签")
+        raise ValueError("请使用已发现的 计费单元ID（/units 查看），不能使用登录标签")
     if not math.isfinite(cost_cny) or cost_cny < 0:
         raise ValueError("成本必须为非负有限数值")
     if idle_split not in ("none", "even"):
