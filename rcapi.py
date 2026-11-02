@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
-import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE_DEFAULT = "https://www.reclaude.ai"
@@ -180,7 +180,3 @@ def retry(fn, attempts: int = 3, delay: float = 1.5):
                 raise
             time.sleep(delay * (i + 1))
     raise last
-
-
-# urllib.parse 在 _load_cookie 里用到
-import urllib.parse  # noqa: E402

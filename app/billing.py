@@ -4,7 +4,7 @@ from __future__ import annotations
 import calendar
 import fnmatch
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 
 # ------------------------------------------------------------------ 日期工具
@@ -61,12 +61,14 @@ def weighted_usage(conn, account_id: str, start_ms: int, end_ms: int) -> dict:
     rows = conn.execute(
         """SELECT user_id, model, cost_usd, COUNT(*) n FROM requests
            WHERE account_id=? AND created_at>=? AND created_at<=?
-             AND cost_usd IS NOT NULL AND COALESCE(pricing_status,'')!='ignored'
+             AND cost_usd IS NOT NULL
+             AND COALESCE(pricing_status,'') NOT IN ('ignored','not_billable')
            GROUP BY user_id, model, ROUND(cost_usd, 8)""",
         (account_id, start_ms, end_ms)).fetchall()
     per_user: dict = {}
     unrated: dict = {}
     unassigned_w = 0.0
+    unassigned_n = 0
     for r in rows:
         mult, configured = multiplier_for(rates, r["model"])
         w = float(r["cost_usd"]) * r["n"] * mult
@@ -75,22 +77,36 @@ def weighted_usage(conn, account_id: str, start_ms: int, end_ms: int) -> dict:
         uid = r["user_id"]
         if uid is None:
             unassigned_w += w
+            unassigned_n += r["n"]
             continue
         slot = per_user.setdefault(uid, {"weighted": 0.0, "raw": 0.0, "requests": 0})
         slot["weighted"] += w
         slot["raw"] += float(r["cost_usd"]) * r["n"]
         slot["requests"] += r["n"]
     return {"per_user": per_user, "unassigned_weighted": unassigned_w,
-            "unrated_models": unrated, "rates": rates}
+            "unassigned_requests": unassigned_n, "unrated_models": unrated, "rates": rates}
 
 
 def pending_stats(conn, account_id: str, start_ms: int, end_ms: int) -> dict:
+    """未定价统计。ignored / not_billable 是官方明确不计费的，不能算作 pending。"""
+    stale_hours = 24.0
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key='stale_hours'").fetchone()
+        if row:
+            stale_hours = float(row["value"])
+    except (TypeError, ValueError):
+        pass
+    stale_before = int(time.time() * 1000) - int(stale_hours * 3_600_000)
     row = conn.execute(
-        """SELECT COUNT(*) n, COALESCE(SUM(total_tokens),0) tok FROM requests
+        """SELECT COUNT(*) n, COALESCE(SUM(total_tokens),0) tok,
+                  COALESCE(SUM(CASE WHEN created_at<? THEN 1 ELSE 0 END),0) stale
+           FROM requests
            WHERE account_id=? AND created_at>=? AND created_at<=?
-             AND (cost_usd IS NULL OR COALESCE(pricing_status,'')!='priced')""",
-        (account_id, start_ms, end_ms)).fetchone()
-    return {"requests": row["n"], "tokens": row["tok"]}
+             AND cost_usd IS NULL
+             AND COALESCE(pricing_status,'pending')
+                 NOT IN ('ignored','not_billable','priced')""",
+        (stale_before, account_id, start_ms, end_ms)).fetchone()
+    return {"requests": row["n"], "tokens": row["tok"], "stale": row["stale"]}
 
 
 # ------------------------------------------------------------------ 租期
@@ -131,7 +147,7 @@ def _split_cost(total_cny: float, shares: dict[int, float]) -> dict[int, float]:
     if total_w <= 0:
         return {}
     cents_total = round(total_cny * 100)
-    cents = {u: int(round(total_cny * 100 * (w / total_w))) for u, w in shares.items()}
+    cents = {u: round(total_cny * 100 * (w / total_w)) for u, w in shares.items()}
     diff = cents_total - sum(cents.values())
     if diff:
         biggest = max(shares, key=lambda u: shares[u])
@@ -148,7 +164,7 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
               "users": {}, "anomalies": {"incomplete": [], "uncovered": [], "stale": [],
                                          "unrated_models": {}, "unassigned": []}}
     covered_ranges: dict[str, list[tuple[int, int]]] = {}
-    for aid, acc in accounts.items():
+    for aid in accounts:
         for p in periods(conn, aid):
             if not period_overlaps(p, start, end):
                 continue
@@ -161,10 +177,20 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
                 slot["weighted"] += w
                 slot["accounts"].append(aid)
             total_w = sum(v["weighted"] for v in usage["per_user"].values())
+            unassigned_w = usage["unassigned_weighted"]
+            # 分摊分母必须包含未归属用量，否则未归属那份会被转嫁给已归属用户
+            denom = total_w + unassigned_w
             cost = float(p["cost_cny"])
             status = "provisional" if p_end >= today() else "final"
+            # 未定价统计先做：整期只有 pending 时 denom=0，若放在后面的分摊分支里会被跳过
+            pend = pending_stats(conn, aid, s_ms, e_ms)
+            if pend["requests"]:
+                result["anomalies"]["stale"].append({
+                    "account_id": aid, "period": f"{p['start_date']}~{p['end_date']}",
+                    "requests": pend["requests"], "tokens": pend["tokens"],
+                    "stale": pend["stale"]})
             note = []
-            if total_w <= 0:
+            if denom <= 0:
                 if p["idle_split"] == "even":
                     seat_users = [r["user_id"] for r in conn.execute(
                         "SELECT DISTINCT user_id FROM devices WHERE account_id=? AND user_id IS NOT NULL",
@@ -182,6 +208,8 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
                             result["users"][u] = result["users"].get(u, 0.0) + amt
                         continue
                 note.append("整期零用量，未分摊")
+                if pend["requests"]:
+                    note.append(f"另有 {pend['requests']} 条未定价")
                 result["periods"].append({
                     "account_id": aid, "period_id": p["id"], "start": p["start_date"],
                     "end": p["end_date"], "cost_cny": cost, "total_weighted": 0.0,
@@ -189,30 +217,37 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
                     "requests": 0, "amount_cny": 0.0, "status": status,
                     "note": " / ".join(note)})
                 continue
-            unit = cost / total_w
-            amounts = _split_cost(cost, {u: v["weighted"] for u, v in usage["per_user"].items()})
+            unit = cost / denom
+            shares = {u: v["weighted"] for u, v in usage["per_user"].items()}
+            if unassigned_w > 0:
+                shares[None] = unassigned_w          # 未归属份额：保留在待认领，不转嫁
+            amounts = _split_cost(cost, shares)
+            unassigned_amount = amounts.pop(None, 0.0)
             for uid, v in sorted(usage["per_user"].items(), key=lambda kv: -kv[1]["weighted"]):
                 result["periods"].append({
                     "account_id": aid, "period_id": p["id"], "start": p["start_date"],
-                    "end": p["end_date"], "cost_cny": cost, "total_weighted": total_w,
+                    "end": p["end_date"], "cost_cny": cost, "total_weighted": denom,
                     "unit_price": unit, "user_id": uid, "weighted": v["weighted"],
                     "raw_usd": v["raw"], "requests": v["requests"],
                     "amount_cny": amounts.get(uid, 0.0), "status": status,
                     "note": ""})
                 result["users"][uid] = result["users"].get(uid, 0.0) + amounts.get(uid, 0.0)
-            if usage["unassigned_weighted"] > 0:
+            if unassigned_w > 0:
                 result["anomalies"]["unassigned"].append({
                     "account_id": aid, "period_id": p["id"],
-                    "weighted": usage["unassigned_weighted"],
-                    "amount_cny": usage["unassigned_weighted"] * unit})
-            pend = pending_stats(conn, aid, s_ms, e_ms)
-            if pend["requests"]:
-                result["anomalies"]["stale"].append({
-                    "account_id": aid, "period": f"{p['start_date']}~{p['end_date']}",
-                    "requests": pend["requests"], "tokens": pend["tokens"]})
+                    "weighted": unassigned_w,
+                    "requests": usage["unassigned_requests"],
+                    "amount_cny": unassigned_amount})
+                result["periods"].append({
+                    "account_id": aid, "period_id": p["id"], "start": p["start_date"],
+                    "end": p["end_date"], "cost_cny": cost, "total_weighted": denom,
+                    "unit_price": unit, "user_id": None, "weighted": unassigned_w,
+                    "raw_usd": 0.0, "requests": usage["unassigned_requests"],
+                    "amount_cny": unassigned_amount, "status": status,
+                    "note": "未归属用量（待认领，未计入个人账单）"})
 
     # 没配租期的账号却有请求 → incomplete
-    for aid, acc in accounts.items():
+    for aid in accounts:
         ranges = covered_ranges.get(aid, [])
         row = conn.execute("SELECT COUNT(*) n FROM requests WHERE account_id=?", (aid,)).fetchone()
         if row["n"] and not periods(conn, aid):
@@ -245,6 +280,12 @@ def create_invoices(conn, bill: dict, note: str | None = None) -> list[int]:
             continue
         by_user.setdefault(line["user_id"], []).append(line)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # 同一区间重复出账时覆盖旧快照，避免 /report save 点两次就出两套账单
+    old = conn.execute("SELECT id FROM invoices WHERE period_start=? AND period_end=?",
+                       (bill["start"], bill["end"])).fetchall()
+    for r in old:
+        conn.execute("DELETE FROM invoice_lines WHERE invoice_id=?", (r["id"],))
+        conn.execute("DELETE FROM invoices WHERE id=?", (r["id"],))
     for uid, lines in by_user.items():
         total = round(sum(l["amount_cny"] for l in lines), 2)
         cur = conn.execute(

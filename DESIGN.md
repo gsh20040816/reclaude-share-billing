@@ -240,7 +240,7 @@ CREATE TABLE requests (
   cache_create_5m_tokens INTEGER, cache_create_1h_tokens INTEGER,
   cache_read_input_tokens INTEGER, total_tokens INTEGER,
   cost_usd       REAL,                     -- pending 时为 NULL
-  pricing_status TEXT,                     -- priced|pending|ignored
+  pricing_status TEXT,                     -- priced|pending|ignored|not_billable
   deduction_status TEXT,
   tracking_id    TEXT,
   first_seen_at  TEXT NOT NULL,
@@ -377,13 +377,15 @@ account_id × [start_date, end_date] × cost_cny
 对每个账号期：
 
 ```
-p   = cost_cny / Σ w(该账号该期全部请求)        # 单位加权量的价格
+p   = cost_cny / (Σ w(已归属) + Σ w(未归属))     # 分母含未归属用量
 用户账单 += Σ_{该账号该期} w(该用户) × p
+待认领   += Σ w(未归属) × p                       # 单独挂账，不计入任何个人
 ```
 
 性质：
 
-- 该期所有用户金额之和 **恰好等于账号成本**（不多不少），这是合租分摊而不是加价转售
+- 该期已归属用户金额之和 + 待认领份额 **恰好等于账号成本**（不多不少），这是合租分摊而不是加价转售
+- 未归属（`user_id IS NULL`）的用量同样进分母，其份额作为「待认领」挂在账单上，**不转嫁给已归属用户**
 - 倍率改变的是「谁承担多少」，不改变总额 —— 所以倍率配错只会让人头之间失衡，不会让总额错
 - 空转成本按在场的人按比例承担；若希望"没人用时成本不摊"，该期 `idle_split='even'` 改成人均
 
@@ -393,9 +395,10 @@ p   = cost_cny / Σ w(该账号该期全部请求)        # 单位加权量的�
 - **Σw = 0**（期内完全没用）→ 单价无定义：`idle_split='none'` 该期不摊，`'even'` 按席位人均
 - **账号没配租期** → 其用量无法定价，账单标 `incomplete` 并列出缺配置的账号（不静默按 0 算）
 - **期重叠** → 拒绝写入；**期之间的空档**里的请求 → 进「未覆盖」清单，不猜归属
-- **出账即快照**：`invoice_lines` 存当时的加权用量、单价、金额。之后改倍率/改租期**不回溯**已出账期
+- **出账即快照**：`invoice_lines` 存当时的加权用量、单价、金额。之后改倍率/改租期**不回溯**已出账期；
+  同一区间重复出账覆盖旧快照，不产生第二套账单
 - **未定价请求**：`pending` 超 24h 的按 tokens 估（若配了 token 单价）或标 `stale` 单列；
-  `ignored` 的请求直接排除（失败请求不计费）
+  `ignored` / `not_billable` 的请求直接排除（官方明确不计费），也不计入未定价/超时统计
 - **出账前**调一次 `POST /api/app/account/usage/refresh`，把官方 /usage 快照刷到最新
 
 
@@ -508,7 +511,7 @@ pricing_status, deduction_status, platform, updated_at`
 | 模型倍率 + 租期成本分摊 + 账单快照 | `app/billing.py` |
 | Telegram Bot（管理员/用户/白名单/演练） | `app/bot.py` |
 | 运维 CLI（同一套 core） | `app/cli.py` |
-| 离线测试（FakeClient） | `tests/test_core.py`（7 个，全绿） |
+| 离线测试（FakeClient / 临时库） | `tests/`（多个离线测试套件，全绿） |
 
 **验收对账**：真实账号 7 天窗口采集 11,241 条请求；按设备汇总与后台 `usage/stats` 的
 `total_usd` 逐台一致（差额 0.0000），含两台已撤销、已从设备列表消失的设备。

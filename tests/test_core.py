@@ -188,8 +188,8 @@ def test_enroll_approve_registers_device(env):
     state.devices_next = [{"id": 777, "name": "u999@999", "org_id": 1, "sk_prefix": "sk-rec-x",
                            "last_used_at": store.now_ms(), "created_at": store.now_ms(),
                            "machine_summary": {}, "client_platform": "linux"}]
-    plan = enroll.enroll(rt.pool, rt.conn, state="STATE654321", tg_user_id=999,
-                         device_name="u999@999", dry_run=False, max_wait=0.1)
+    enroll.enroll(rt.pool, rt.conn, state="STATE654321", tg_user_id=999,
+                  device_name="u999@999", dry_run=False, max_wait=0.1)
     assert any(p[0] == "/api/cli/auth/approve" for p in state.posts)
     row = rt.conn.execute("SELECT * FROM devices WHERE rc_device_id=777").fetchone()
     assert row is not None and row["user_id"] == 999

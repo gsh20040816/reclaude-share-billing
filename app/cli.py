@@ -24,15 +24,44 @@ def cmd_account_add(args) -> None:
     rt = _rt(args)
     if store.account_row(rt.conn, args.id):
         sys.exit(f"账号 {args.id} 已存在")
-    rt.conn.execute(
-        """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)
-           VALUES (?,?,?,?, 'ok', ?)""",
-        (args.id, args.id, args.email, encrypt(args.password) if args.password else "",
-         store.iso()))
-    rt.conn.commit()
-    if args.start and args.end and args.cost:
-        billing.add_period(rt.conn, args.id, billing.parse_date(args.start),
-                           billing.parse_date(args.end), float(args.cost))
+    start = end = cost = None
+    if args.start is not None or args.end is not None or args.cost is not None:
+        if not (args.start and args.end and args.cost):
+            rt.close()
+            sys.exit("--start / --end / --cost 需要同时提供")
+        try:
+            start = billing.parse_date(args.start)
+            end = billing.parse_date(args.end)
+            cost = float(args.cost)
+        except Exception as exc:                 # noqa: BLE001
+            rt.close()
+            sys.exit(f"日期或金额格式不对：{exc}")
+        if end < start:
+            rt.close()
+            sys.exit("结束日期早于开始日期")
+        if not (cost >= 0):
+            rt.close()
+            sys.exit("成本不能为负数")
+    try:
+        rt.conn.execute(
+            """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)
+               VALUES (?,?,?,?, 'ok', ?)""",
+            (args.id, args.id, args.email, encrypt(args.password) if args.password else "",
+             store.iso()))
+        rt.conn.commit()
+        if start is not None:
+            billing.add_period(rt.conn, args.id, start, end, cost)
+    except Exception as exc:                     # noqa: BLE001
+        rt.conn.rollback()
+        periods = rt.conn.execute(
+            "SELECT COUNT(*) n FROM account_periods WHERE account_id=?", (args.id,)).fetchone()["n"]
+        reqs = rt.conn.execute(
+            "SELECT COUNT(*) n FROM requests WHERE account_id=?", (args.id,)).fetchone()["n"]
+        if not periods and not reqs:
+            rt.conn.execute("DELETE FROM rc_accounts WHERE id=?", (args.id,))
+            rt.conn.commit()
+        rt.close()
+        sys.exit(f"添加账号失败：{exc}")
     try:
         info = rt.pool.login_now(args.id)
         print(json.dumps(info, ensure_ascii=False, indent=2))
@@ -139,7 +168,9 @@ def cmd_health(args) -> None:
               f"/{a['capacity']} last_sync={wm['last_synced_at'] if wm else None}"
               f" err={(a['last_error'] or '')[:80]}")
     print("requests:", rt.conn.execute("SELECT COUNT(*) c FROM requests").fetchone()["c"],
-          "unpriced:", rt.conn.execute("SELECT COUNT(*) c FROM requests WHERE cost_usd IS NULL").fetchone()["c"])
+          "unpriced:", rt.conn.execute(
+              "SELECT COUNT(*) c FROM requests WHERE cost_usd IS NULL "
+              "AND COALESCE(pricing_status,'') NOT IN ('ignored','not_billable')").fetchone()["c"])
     rt.close()
 
 

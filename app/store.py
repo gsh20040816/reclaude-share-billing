@@ -171,6 +171,7 @@ DEFAULTS = {
     "stale_hours": "24",
     "default_multiplier": "1.0",
     "history_page_limit": "200",
+    "alert_after_failures": "3",
 }
 
 

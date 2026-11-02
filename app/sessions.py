@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from contextlib import contextmanager
 
 import rcapi
@@ -94,18 +93,26 @@ class SessionPool:
                 raise AccountUnavailable(f"账号 {account_id} 已停用")
             client = self._client(row)
             sess = Session(self, account_id, client)
+            ok = True
             try:
                 yield sess
+            except BaseException:
+                ok = False
+                raise
             finally:
-                self._save_cookie(account_id, sess.client)
+                self._save_cookie(account_id, sess.client, ok=ok)
 
     # ------------------------------------------------------------------
-    def _save_cookie(self, account_id: str, client) -> None:
+    def _save_cookie(self, account_id: str, client, ok: bool = True) -> None:
         cookie = getattr(client, "cookie", "")
         if not cookie:
             return
-        self.conn.execute("UPDATE rc_accounts SET cookie=?, status='ok', last_error=NULL WHERE id=?",
-                          (cookie, account_id))
+        if ok:
+            self.conn.execute("UPDATE rc_accounts SET cookie=?, status='ok', last_error=NULL WHERE id=?",
+                              (cookie, account_id))
+        else:
+            # 请求失败（403/429/5xx 等）时仍回写轮转后的 cookie，但不掩盖账号状态
+            self.conn.execute("UPDATE rc_accounts SET cookie=? WHERE id=?", (cookie, account_id))
         self.conn.commit()
 
     def _relogin(self, account_id: str):

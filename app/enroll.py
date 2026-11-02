@@ -1,6 +1,13 @@
-"""开通：用户提交 reclaude login 授权链接 → 选账号 → 批准 → 登记 device_id。"""
+"""开通：用户提交 reclaude login 授权链接 → 选账号 → 批准 → 登记 device_id。
+
+批准后设备通常几秒内出现在账号的设备列表，此时按 (账号, name, user_id IS NULL,
+rc_device_id 不在批准前集合) 精确匹配并绑定。若 max_wait 内设备仍未出现，就写一条
+login_states(status='approved_pending_device', note=JSON{device_name, approved_at_ms})；
+后续 syncer.sync_account 里的 _claim_pending_logins 会在设备出现时自动认领并回填归因。
+"""
 from __future__ import annotations
 
+import json
 import time
 
 from . import evictor, store
@@ -15,8 +22,9 @@ class EnrollError(Exception):
 
 
 def used_slots(conn, account_id: str) -> int:
+    # unknown/missing 只是历史流水或已从 API 消失的残留，不占真实席位。
     row = conn.execute(
-        "SELECT COUNT(*) n FROM devices WHERE account_id=? AND state IN ('active','unknown','evicting')",
+        "SELECT COUNT(*) n FROM devices WHERE account_id=? AND state IN ('active','evicting')",
         (account_id,)).fetchone()
     return row["n"]
 
@@ -41,12 +49,22 @@ def free_account(conn):
 
 
 def pick_account(conn, preferred: str | None = None, exclude: set[int] | None = None):
-    """-> (account_row, victim_row|None)。victim 不为空表示需要先下线。"""
+    """-> (account_row, victim_row|None)。victim 不为空表示需要先下线。
+
+    preferred 是硬约束：只允许用这一个账号，不能回退到账号池里的其他账号。
+    """
     accounts = [a for a in store.enabled_accounts(conn) if a["status"] in ("ok", None)]
     if preferred:
-        accounts = [a for a in accounts if a["id"] == preferred] or accounts
+        accounts = [a for a in accounts if a["id"] == preferred]
+        if not accounts:
+            return None, None
+        acc = accounts[0]
+        if used_slots(conn, acc["id"]) < account_capacity(conn, acc["id"]):
+            return acc, None
+        victim = evictor.choose_victim(conn, acc["id"], exclude=exclude)
+        return (acc, victim) if victim is not None else (None, None)
     free = free_account(conn)
-    if free and (not preferred or free["id"] == preferred or True):
+    if free:
         return free, None
     # 没有空位 → 找一台可下线的
     for acc in accounts:
@@ -61,12 +79,22 @@ def describe(pool, conn, state: str, account_id: str) -> dict:
         return s.post("/api/cli/auth/describe", {"state": state})
 
 
-def _new_device_id(conn, account_id: str, before: set[int]) -> int | None:
-    rows = conn.execute("SELECT rc_device_id FROM devices WHERE account_id=?", (account_id,)).fetchall()
-    for r in rows:
-        if r["rc_device_id"] not in before:
-            return int(r["rc_device_id"])
-    return None
+def _new_device_id(conn, account_id: str, before: set[int], device_name: str) -> int | None:
+    """只认这次批准创建的那台设备：同账号、未绑定、批准前不存在。
+
+    API 返回的 name 不一定等于 approve 传入的 device_name（实测可能被改写成
+    `reclaude on <hostname>`），所以：只有一个新设备时直接认；出现多个才用
+    name 精确匹配消歧。仍有歧义就返回 None，交给 pending 自动认领。
+    """
+    rows = conn.execute(
+        """SELECT rc_device_id, name FROM devices
+           WHERE account_id=? AND user_id IS NULL""", (account_id,)).fetchall()
+    new = {int(r["rc_device_id"]) for r in rows if int(r["rc_device_id"]) not in before}
+    if len(new) == 1:
+        return new.pop()
+    named = {int(r["rc_device_id"]) for r in rows
+             if int(r["rc_device_id"]) in new and (r["name"] or "") == device_name}
+    return named.pop() if len(named) == 1 else None
 
 
 def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
@@ -109,13 +137,17 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
             syncer.sync_account(pool, conn, acc["id"], since_ms=store.now_ms() - 5 * 60_000)
         except Exception:                       # noqa: BLE001
             pass
-        new_id = _new_device_id(conn, acc["id"], before)
+        new_id = _new_device_id(conn, acc["id"], before, device_name)
         if new_id:
             break
         time.sleep(3)
 
     if new_id is None:
-        # 批准成功但设备还没出现：留一条 login_state，等下一轮采集自动认领
+        # 批准成功但设备还没出现：留一条 login_state（JSON 记录设备名），
+        # 后续采集会调用 _claim_pending_logins 自动认领，不需要管理员手工 /bind。
+        pending_note = json.dumps(
+            {"device_name": device_name, "approved_at_ms": store.now_ms()},
+            ensure_ascii=False)
         conn.execute(
             """INSERT INTO login_states(state, tg_user_id, account_id, status, hostname, os, arch,
                                         client_ip, expires_at, created_at, note)
@@ -124,7 +156,7 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
                  note=excluded.note""",
             (state, tg_user_id, acc["id"], "approved_pending_device", info.get("hostname"),
              info.get("os"), info.get("arch"), info.get("client_ip_masked"),
-             info.get("expires_at"), store.iso(), "设备尚未出现在列表，等采集认领"))
+             info.get("expires_at"), store.iso(), pending_note))
         conn.commit()
         plan["device_id"] = None
         plan["pending"] = True
@@ -140,7 +172,8 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
         """INSERT INTO login_states(state, tg_user_id, account_id, status, hostname, os, arch,
                                     client_ip, expires_at, created_at, note)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(state) DO UPDATE SET status=excluded.status, account_id=excluded.account_id""",
+           ON CONFLICT(state) DO UPDATE SET status=excluded.status, account_id=excluded.account_id,
+             note=excluded.note""",
         (state, tg_user_id, acc["id"], "approved", info.get("hostname"), info.get("os"),
          info.get("arch"), info.get("client_ip_masked"), info.get("expires_at"), store.iso(),
          f"device_id={new_id}"))

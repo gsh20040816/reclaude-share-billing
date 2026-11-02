@@ -3,14 +3,13 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, timedelta
+from datetime import date
 
 from . import billing, enroll, evictor, store, syncer
 from .runtime import Runtime
@@ -73,6 +72,7 @@ class Bot:
         self.admins = {int(x) for x in self.cfg.get("admin_ids", [])}
         self.allowed = {int(x) for x in self.cfg.get("allowed_chat_ids", [])}
         self.flows: dict[int, dict] = {}
+        self._fail_counts: dict[str, int] = {}
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- 权限
@@ -165,7 +165,8 @@ class Bot:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
         if cmd in ("/accounts", "/account_add", "/account_del", "/period", "/periods",
-                   "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/dryrun") \
+                   "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
+                   "/dryrun") \
                 and not self.is_admin(uid):
             self.tg.send(chat["id"], "⛔ 仅管理员可用。", thread)
             return
@@ -461,7 +462,7 @@ class Bot:
             return
         try:
             aid, did = self._resolve_device(args[0])
-            n = enroll.bind_device(self.conn, aid, did, int(args[1]))
+            enroll.bind_device(self.conn, aid, did, int(args[1]))
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
             return
@@ -525,10 +526,16 @@ class Bot:
             lines.append("\n<b>租期外请求</b>")
             for x in an["uncovered"]:
                 lines.append(f"• <code>{x['account_id']}</code> {x['requests']} 条")
-        if an["stale"]:
+        stale_items = an.get("stale") or []
+        if stale_items:
+            stale_hours = store.get_int(self.conn, "stale_hours", 24)
             lines.append("\n<b>未定价</b>")
-            for x in an["stale"]:
-                lines.append(f"• <code>{x['account_id']}</code> {x['period']} {x['requests']} 条")
+            for x in stale_items:
+                if "stale" in x:
+                    lines.append(f"• <code>{x['account_id']}</code> {x['period']} "
+                                 f"{x['requests']} 条（其中超 {stale_hours}h {x['stale']} 条）")
+                else:
+                    lines.append(f"• <code>{x['account_id']}</code> {x['period']} {x['requests']} 条")
         if an["unrated_models"]:
             lines.append("\n<b>未配置倍率的模型</b>")
             for m, v in an["unrated_models"].items():
@@ -549,7 +556,8 @@ class Bot:
             if a["last_error"]:
                 lines.append(f"   ⚠️ {esc(a['last_error'][:140])}")
         pend = self.conn.execute(
-            "SELECT COUNT(*) n FROM requests WHERE cost_usd IS NULL").fetchone()["n"]
+            "SELECT COUNT(*) n FROM requests WHERE cost_usd IS NULL "
+            "AND COALESCE(pricing_status,'') NOT IN ('ignored','not_billable')").fetchone()["n"]
         total = self.conn.execute("SELECT COUNT(*) n FROM requests").fetchone()["n"]
         lines += ["", f"请求流水 {total} 条 · 未定价 {pend} 条",
                   f"演练模式：{'开' if self.cfg.get('dry_run', True) else '关'}"]
@@ -610,16 +618,37 @@ class Bot:
         except Exception:                        # noqa: BLE001
             self.tg.send(chat["id"], "❌ 日期或金额格式不对，流程已取消。重发 /account_add。")
             return True
+        if end < start:
+            self.tg.send(chat["id"], "❌ 结束日期早于开始日期，流程已取消。重发 /account_add。")
+            return True
+        if not (cost >= 0):
+            self.tg.send(chat["id"], "❌ 成本不能为负数，流程已取消。重发 /account_add。")
+            return True
         aid = data["label"].strip()
         if store.account_row(self.conn, aid):
             self.tg.send(chat["id"], f"❌ 账号 <code>{esc(aid)}</code> 已存在。")
             return True
-        self.conn.execute(
-            """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)
-               VALUES (?,?,?,?, 'ok', ?)""",
-            (aid, aid, data["email"].strip(), encrypt(data["password"]), store.iso()))
-        self.conn.commit()
-        billing.add_period(self.conn, aid, start, end, cost)
+        try:
+            self.conn.execute(
+                """INSERT INTO rc_accounts(id, label, email, password_enc, status, created_at)
+                   VALUES (?,?,?,?, 'ok', ?)""",
+                (aid, aid, data["email"].strip(), encrypt(data["password"]), store.iso()))
+            self.conn.commit()
+            billing.add_period(self.conn, aid, start, end, cost)
+        except Exception as exc:                 # noqa: BLE001
+            # 半成品回滚：只有在这条账号没有任何租期/流水时才删，避免误删已有数据。
+            self.conn.rollback()
+            periods = self.conn.execute(
+                "SELECT COUNT(*) n FROM account_periods WHERE account_id=?", (aid,)).fetchone()["n"]
+            reqs = self.conn.execute(
+                "SELECT COUNT(*) n FROM requests WHERE account_id=?", (aid,)).fetchone()["n"]
+            if not periods and not reqs:
+                self.conn.execute("DELETE FROM rc_accounts WHERE id=?", (aid,))
+                self.conn.commit()
+            self.tg.send(chat["id"],
+                         f"❌ 添加账号失败：<code>{esc(str(exc)[:200])}</code>，已回滚。"
+                         "重发 /account_add。")
+            return True
         store.event(self.conn, "account_add", actor=f"tg:{uid}", account_id=aid,
                     detail={"email": data["email"], "start": str(start), "end": str(end), "cost": cost})
         self.tg.send(chat["id"], f"✅ 账号 <code>{esc(aid)}</code> 已加入，正在验证登录…")
@@ -639,13 +668,29 @@ class Bot:
             interval = store.get_int(self.conn, "sync_interval_seconds", 300)
             try:
                 results = syncer.sync_all(self.pool, self.conn)
-                for r in results:
-                    if r.get("error"):
-                        self._notify_admins(f"⚠️ 采集失败 <code>{esc(r['account_id'])}</code>\n"
-                                            f"<code>{esc(r['error'][:200])}</code>")
+                self._handle_sync_results(results)
             except Exception as exc:             # noqa: BLE001
                 self._notify_admins(f"⚠️ 采集循环异常：<code>{esc(str(exc)[:200])}</code>")
             self._stop.wait(interval)
+
+    def _handle_sync_results(self, results) -> None:
+        """按账号跟踪连续失败：达到阈值只告警一次，恢复时再发一条。"""
+        threshold = max(1, store.get_int(self.conn, "alert_after_failures", 3))
+        for r in results:
+            aid = r.get("account_id")
+            if not aid:
+                continue
+            if r.get("error"):
+                count = self._fail_counts.get(aid, 0) + 1
+                self._fail_counts[aid] = count
+                if count == threshold:
+                    self._notify_admins(f"⚠️ 采集连续失败 {count} 次 <code>{esc(aid)}</code>\n"
+                                        f"<code>{esc(str(r['error'])[:200])}</code>")
+            elif aid in self._fail_counts:
+                count = self._fail_counts.pop(aid)
+                if count >= threshold:
+                    self._notify_admins(f"✅ 采集已恢复 <code>{esc(aid)}</code>"
+                                        f"（此前连续失败 {count} 次）")
 
     def _notify_admins(self, text: str) -> None:
         for aid in self.admins:

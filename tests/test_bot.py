@@ -1,13 +1,12 @@
 """Bot 渲染 / 命令路径离线测试：全部走 FakeClient，不发任何网络请求。"""
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import billing, store
+from app import store
 from app.bot import Bot
 from app.runtime import Runtime
 from test_core import FakeClient, FakeState
