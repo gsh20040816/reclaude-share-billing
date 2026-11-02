@@ -1,0 +1,54 @@
+"""Telegram native command menus. Scopes affect discovery, never authorization."""
+import json
+
+from . import store
+
+USER_COMMANDS = [
+    ("me", "我的概览 · 设备与本月账单"),
+    ("devices", "查看我的设备"),
+    ("bill", "查看我的账单"),
+    ("login", "登录设备 · 查看授权链接用法"),
+    ("help", "命令帮助"),
+    ("cancel", "取消当前操作"),
+]
+ADMIN_COMMANDS = [
+    ("accounts", "账号池 · 状态与席位"),
+    ("account_add", "添加账号 · 按提示填写"),
+    ("report", "全员账单与待认领费用"),
+    ("sync", "立即采集用量"),
+    ("health", "检查服务与采集状态"),
+    ("bind", "绑定设备归属 · 查看用法"),
+    ("periods", "查看租期与成本"),
+    ("period", "添加租期 · 查看用法"),
+    ("rates", "查看模型倍率"),
+    ("rate", "设置模型倍率 · 查看用法"),
+    ("revoke", "撤销设备 · 查看用法"),
+    ("account_del", "停用账号 · 查看用法"),
+    ("dryrun", "切换演练模式 · 查看用法"),
+]
+
+
+def configure(bot):
+    """Reconcile menus on startup; report failures without exposing API credentials."""
+    def call(method, **params):
+        if not bot.tg.call(method, **params).get("ok"):
+            raise RuntimeError(f"Telegram menu setup failed: {method}")
+
+    scopes = [{"type": "chat", "chat_id": uid} for uid in sorted(bot.admins)]
+    scopes += [{"type": "chat_member", "chat_id": chat, "user_id": uid}
+               for chat in sorted(bot.allowed) if chat < 0 for uid in sorted(bot.admins)]
+    previous = json.loads(store.get_setting(bot.conn, "telegram_menu_scopes", "[]"))
+    for scope in previous:
+        if scope not in scopes:
+            call("deleteMyCommands", scope=scope, language_code="")
+    def commands(items):
+        return [{"command": cmd, "description": desc} for cmd, desc in items]
+    call("setMyCommands", commands=commands(USER_COMMANDS), scope={"type": "default"}, language_code="")
+    # Remember scopes before writing them, so a later restart can clean up partial success.
+    store.set_setting(bot.conn, "telegram_menu_scopes", json.dumps(scopes))
+    for scope in scopes:
+        call("setMyCommands", commands=commands(ADMIN_COMMANDS + USER_COMMANDS),
+             scope=scope, language_code="")
+    call("setChatMenuButton", menu_button={"type": "commands"})
+    for uid in sorted(bot.admins):
+        call("setChatMenuButton", chat_id=uid, menu_button={"type": "commands"})

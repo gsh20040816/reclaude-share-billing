@@ -61,6 +61,8 @@ scripts/run_bot.sh
 
 ## Bot 命令
 
+启动时自动注册 Telegram 原生命令菜单和私聊「菜单」按钮。普通用户显示个人命令；配置的管理员在私聊及白名单群内获得额外管理命令。`/cancel` 可取消当前填写流程，菜单展示不替代后端权限检查。
+
 用户：`/login <授权链接>` `/me` `/devices` `/bill [起 止]` `/help`
 
 管理员：`/accounts` `/account_add` `/account_del` `/period add` `/periods` `/rate` `/rates`

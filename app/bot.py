@@ -86,6 +86,12 @@ class Bot:
 
     # ---------------------------------------------------------------- 主循环
     def run(self) -> None:
+        from .menu import configure
+        try:
+            configure(self)
+        except Exception as exc:
+            # A temporary menu API failure must not stop billing/long polling.
+            print(f"menu setup failed ({type(exc).__name__}); retry on restart", flush=True)
         threading.Thread(target=self.sync_loop, daemon=True).start()
         offset = None
         while not self._stop.is_set():
@@ -153,6 +159,7 @@ class Bot:
         args = parts[1:]
         handler = {
             "/start": self.cmd_help, "/help": self.cmd_help,
+            "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
             "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
@@ -174,6 +181,10 @@ class Bot:
         handler(chat, msg, uid, args, thread)
 
     # ---------------------------------------------------------------- 用户命令
+    def cmd_cancel(self, chat, msg, uid, args, thread) -> None:
+        self.flows.pop(uid, None)
+        self.tg.send(chat["id"], "已取消当前操作。", thread)
+
     def cmd_help(self, chat, msg, uid, args, thread) -> None:
         lines = ["<b>ReClaude 合租</b>", "",
                  "<b>用户</b>",
@@ -181,7 +192,8 @@ class Bot:
                  "• <code>/me</code> 我的设备与本月账单",
                  "• <code>/devices</code> 我的设备列表",
                  "• <code>/bill [起] [止]</code> 我的账单明细",
-                 "• <code>/help</code> 本帮助"]
+                 "• <code>/help</code> 本帮助",
+                 "• <code>/cancel</code> 取消当前操作"]
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
                       "• <code>/accounts</code> 账号池状态",
