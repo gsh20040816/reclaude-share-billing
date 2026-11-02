@@ -202,7 +202,10 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                 _upsert_devices(conn, account_id, s.devices())
                 _claim_pending_logins(conn, account_id)
                 quota = s.device_quota()
-                ledger.discover(conn, account_id, s.get("/api/app/orgs/"), quota)
+                orgs = s.get("/api/app/orgs/")
+                own = ledger.discover(conn, account_id, orgs, quota)
+                if own is not None:
+                    ledger.observe_own_start(conn, own, orgs, s.get(f"/api/app/me?org_id={own}"))
             except Exception:                     # 设备列表失败不阻塞流水采集
                 conn.rollback()
         cursor = progress["cursor"] if progress else None

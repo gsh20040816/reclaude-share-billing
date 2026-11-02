@@ -162,7 +162,7 @@ class Bot:
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
-            "/unit_link": self.cmd_unit_link, "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
+            "/renew": self.cmd_renew, "/unit_link": self.cmd_unit_link, "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
             "/account_del": self.cmd_account_del, "/period": self.cmd_period,
             "/periods": self.cmd_periods, "/rate": self.cmd_rate, "/rates": self.cmd_rates,
             "/revoke": self.cmd_revoke, "/bind": self.cmd_bind, "/sync": self.cmd_sync,
@@ -172,7 +172,7 @@ class Bot:
         if handler is None:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
-        if cmd in ("/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
+        if cmd in ("/renew", "/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
                    "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
                    "/dryrun") \
                 and not self.is_admin(uid):
@@ -202,6 +202,9 @@ class Bot:
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
                       "• <code>/period add &lt;计费单元ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
                       "• <code>/periods [账号]</code> 租期与成本",
+                      "• <code>/renew 计费单元ID 天数 金额</code> 接续上一期，精确到分钟",
+                      "• 首期自动时间：<code>/period add 计费单元ID auto auto 金额</code>",
+                      "• 手动时间：YYYY-MM-DDTHH:MM（北京时间，结束时刻不包含）",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
                       "• <code>/revoke &lt;账号:设备id&gt;</code> 下线设备",
@@ -358,7 +361,11 @@ class Bot:
             sub = self.conn.execute('SELECT * FROM org_subscriptions WHERE org_id=?', (unit['org_id'],)).fetchone()
             if sub and sub['expires_at']:
                 lines.append(f"  上游到期：{store.iso(sub['expires_at'])}（自动观测）")
-                lines.append("  开始日期待核实；到期延长不自动新增成本或修改已配置租期")
+                if sub['started_at']:
+                    lines.append(f"  上游开始：{store.iso(sub['started_at'])}（已核对本组织）")
+                else:
+                    lines.append("  开始时间待核实")
+                lines.append("  到期延长不自动新增成本或修改已配置租期")
             aliases = self.conn.execute('SELECT upstream_account_id FROM upstream_assignments WHERE unit_id=?', (unit['id'],)).fetchall()
             lines.append("  历史上游账号：" + ', '.join(str(r[0]) for r in aliases))
             ps = billing.periods(self.conn, unit["id"])
@@ -396,7 +403,21 @@ class Bot:
         self.tg.send(chat["id"], f"已停用 <code>{esc(aid)}</code>（历史流水与账单保留）。", thread)
 
     # ---------------------------------------------------------------- 管理员：租期
+    def cmd_renew(self, chat, msg, uid, args, thread):
+        if len(args) != 3:
+            self.tg.send(chat['id'], '用法：/renew 计费单元ID 天数 金额\n例：/renew 25693:seat1 30 850\n从上一期结束时刻接续（北京时间，结束时刻不包含）。', thread)
+            return
+        p = billing.renew_period(self.conn, args[0], int(args[1]), float(args[2]),
+                                 message_key=f"{chat['id']}:{msg['message_id']}")
+        self.tg.send(chat['id'], f"✅ 续费租期 #{p['id']}：{p['start_date']} ~ {p['end_date']} {money(p['cost_cny'])}\n结束时刻不包含；同一条消息重试不会重复续费。", thread)
+
     def cmd_period(self, chat, msg, uid, args, thread) -> None:
+        if args and args[0] == 'extend':
+            if len(args) != 3:
+                raise ValueError('用法：/period extend 租期ID YYYY-MM-DDTHH:MM（补偿延期，不增加成本）')
+            billing.extend_period(self.conn, int(args[1]), billing.parse_boundary(args[2]))
+            self.tg.send(chat['id'], '✅ 已延长原周期，原成本不变；下次续费从延长后的结束时刻接续。', thread)
+            return
         if args and args[0] == "assign":
             if len(args) != 3:
                 self.tg.send(chat["id"], "用法：/period assign 旧租期ID 计费单元ID", thread)
@@ -415,11 +436,16 @@ class Bot:
         aid, s, e, cost = args[1], args[2], args[3], args[4]
         split = args[5] if len(args) > 5 else "none"
         try:
-            pid = billing.add_period(self.conn, aid, billing.parse_date(s), billing.parse_date(e),
+            if s == 'auto' and e == 'auto':
+                start, end = billing.automatic_boundaries(self.conn, aid)
+            else:
+                start, end = billing.parse_boundary(s), billing.parse_boundary(e)
+            pid = billing.add_period(self.conn, aid, start, end,
                                      float(cost), idle_split=split)
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
             return
+        s, e = start.isoformat(), end.isoformat()
         store.event(self.conn, "period_add", actor=f"tg:{uid}", account_id=aid,
                     detail={"id": pid, "start": s, "end": e, "cost": cost})
         self.tg.send(chat["id"], f"✅ 已记录租期 #{pid}：{esc(aid)} {s}~{e} {money(float(cost))}", thread)

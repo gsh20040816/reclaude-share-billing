@@ -42,7 +42,9 @@ def observe(conn, org):
     if latest is None or (latest['expires_at'], latest['upstream_account_id'], latest['seat_count']) != (expires, account, seats):
         conn.execute('INSERT INTO subscription_observations(org_id,expires_at,upstream_account_id,seat_count,observed_at) '
                      'VALUES (?,?,?,?,?)', (org_id, expires, account, seats, now))
-    conn.execute("""INSERT INTO org_subscriptions VALUES (?,?,?,?,?) ON CONFLICT(org_id) DO UPDATE SET
+    conn.execute("""INSERT INTO org_subscriptions(org_id,seat_count,expires_at,observed_at,ever_multi) VALUES (?,?,?,?,?) ON CONFLICT(org_id) DO UPDATE SET
+        started_at=CASE WHEN expires_at=excluded.expires_at THEN started_at ELSE NULL END,
+        start_source=CASE WHEN expires_at=excluded.expires_at THEN start_source ELSE NULL END,
         seat_count=excluded.seat_count, expires_at=excluded.expires_at, observed_at=excluded.observed_at,
         ever_multi=MAX(org_subscriptions.ever_multi,excluded.ever_multi)""",
         (org_id, seats, expires, now, int(seats is not None and seats > 1)))
@@ -98,3 +100,18 @@ def bind(conn, org_id, device_id, user_id):
                      'DO UPDATE SET user_id=excluded.user_id', (org_id, device_id, user_id))
     conn.execute('UPDATE devices SET user_id=? WHERE org_id=? AND rc_device_id=?', (user_id, org_id, device_id))
     conn.execute('UPDATE requests SET user_id=? WHERE org_id=? AND rc_device_id=?', (user_id, org_id, device_id))
+
+
+def observe_own_start(conn, own_org_id, orgs, me):
+    """me's start belongs to the credential owner, even when another org is selected."""
+    org = next((o for o in orgs.get('items', []) if o['id'] == own_org_id and o.get('role') == 'owner'), None)
+    if not org:
+        return
+    sub = me.get('subscription') or {}
+    start, end = sub.get('period_started_at'), sub.get('expires_at')
+    valid = (isinstance(start, int) and isinstance(end, int) and 0 < start < end
+             and end == org.get('subscription_expires_at')
+             and start >= (org.get('created_at') or 0))
+    conn.execute('UPDATE org_subscriptions SET started_at=?,start_source=? WHERE org_id=?',
+                 (start if valid else None, 'owner subscription API' if valid else None, own_org_id))
+    conn.commit()

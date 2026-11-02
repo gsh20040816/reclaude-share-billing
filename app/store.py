@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS org_subscriptions (
   observed_at TEXT NOT NULL,
   ever_multi INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS renewal_receipts (
+  message_key TEXT PRIMARY KEY,
+  period_id INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS subscription_observations (
   id INTEGER PRIMARY KEY,
   org_id INTEGER NOT NULL,
@@ -248,6 +252,7 @@ def init(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM sync_progress")
     # Additive migration: old costs stay unassigned until explicitly mapped.
     for table, columns in {
+        "org_subscriptions": [("started_at", "INTEGER"), ("start_source", "TEXT")],
         "requests": [("upstream_account_id", "INTEGER"), ("billing_unit_id", "TEXT")],
         "account_periods": [("billing_unit_id", "TEXT")],
         "invoice_lines": [("billing_unit_id", "TEXT")],

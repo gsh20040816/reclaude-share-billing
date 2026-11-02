@@ -5,7 +5,8 @@ import calendar
 import fnmatch
 import math
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 # ------------------------------------------------------------------ 日期工具
@@ -118,20 +119,46 @@ def periods(conn, account_id: str | None = None):
     return conn.execute("SELECT * FROM account_periods WHERE billing_unit_id IS NOT NULL ORDER BY billing_unit_id, start_date").fetchall()
 
 
-def period_overlaps(p, start: date, end: date) -> bool:
-    return not (parse_date(p["end_date"]) < start or parse_date(p["start_date"]) > end)
+BILLING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def parse_boundary(value):
+    if len(value) == 10:
+        return parse_date(value)
+    result = datetime.fromisoformat(value)
+    return result.replace(tzinfo=BILLING_TZ) if result.tzinfo is None else result.astimezone(BILLING_TZ)
+
+
+def boundary_ms(value, *, end=False):
+    if isinstance(value, datetime):
+        dt = value.replace(tzinfo=BILLING_TZ) if value.tzinfo is None else value
+        return int(dt.timestamp() * 1000)
+    # Legacy date-only ends include the entire final day.
+    return day_start_ms(value) + (86400000 if end else 0)
+
+
+def period_bounds(p):
+    return (boundary_ms(parse_boundary(p['start_date'])),
+            boundary_ms(parse_boundary(p['end_date']), end=True))
+
+
+def period_overlaps(p, start, end):
+    lo, hi = period_bounds(p)
+    return lo < boundary_ms(end, end=True) and hi > boundary_ms(start)
 
 
 def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
-               idle_split: str = "none", note: str | None = None) -> int:
+               idle_split: str = "none", note: str | None = None, *, _commit=True) -> int:
     if not conn.execute("SELECT 1 FROM billing_units WHERE id=?", (account_id,)).fetchone():
         raise ValueError("请使用已发现的 计费单元ID（/units 查看），不能使用登录标签")
     if not math.isfinite(cost_cny) or cost_cny < 0:
         raise ValueError("成本必须为非负有限数值")
     if idle_split not in ("none", "even"):
         raise ValueError("idle_split 必须是 none 或 even")
-    if end < start:
-        raise ValueError("结束日期早于开始日期")
+    if boundary_ms(end, end=True) <= boundary_ms(start):
+        raise ValueError("结束时间必须晚于开始时间")
+    # Serialize overlap validation and insertion across SQLite connections.
+    conn.execute("UPDATE settings SET value=value WHERE key='subscription_ledger_v1'")
     for p in periods(conn, account_id):
         if period_overlaps(p, start, end):
             raise ValueError(f"与已有租期重叠：{p['start_date']} ~ {p['end_date']}")
@@ -141,8 +168,63 @@ def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
            VALUES (?,?,?,?,?,?,?,?)""",
         (account_id, account_id, start.isoformat(), end.isoformat(), float(cost_cny), idle_split,
          note, time.strftime("%Y-%m-%dT%H:%M:%S")))
-    conn.commit()
+    if _commit:
+        conn.commit()
     return cur.lastrowid
+
+
+def renew_period(conn, unit_id, days, cost_cny, *, message_key):
+    if not isinstance(days, int) or not 1 <= days <= 3660:
+        raise ValueError('续费天数必须是 1~3660 的整数')
+    try:
+        conn.execute("UPDATE settings SET value=value WHERE key='subscription_ledger_v1'")
+        receipt = conn.execute('SELECT period_id FROM renewal_receipts WHERE message_key=?', (message_key,)).fetchone()
+        if receipt:
+            row = conn.execute('SELECT * FROM account_periods WHERE id=?', (receipt[0],)).fetchone()
+            conn.commit()
+            return row
+        previous = periods(conn, unit_id)
+        if not previous:
+            raise ValueError('尚未配置首期成本；请先 /period add 计费单元ID auto auto 金额，或填写首期时间')
+        latest = max(previous, key=lambda p: period_bounds(p)[1])
+        start_ms = period_bounds(latest)[1]
+        start = datetime.fromtimestamp(start_ms / 1000, BILLING_TZ)
+        end = start + timedelta(days=days)
+        pid = add_period(conn, unit_id, start, end, cost_cny,
+                         idle_split=latest['idle_split'], note='管理员确认续费', _commit=False)
+        conn.execute('INSERT INTO renewal_receipts VALUES (?,?)', (message_key, pid))
+        conn.commit()
+        return conn.execute('SELECT * FROM account_periods WHERE id=?', (pid,)).fetchone()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def extend_period(conn, period_id, end):
+    try:
+        conn.execute("UPDATE settings SET value=value WHERE key='subscription_ledger_v1'")
+        p = conn.execute('SELECT * FROM account_periods WHERE id=?', (period_id,)).fetchone()
+        if not p or not p['billing_unit_id']:
+            raise ValueError('未找到已归属的租期')
+        if boundary_ms(end, end=True) <= period_bounds(p)[1]:
+            raise ValueError('补偿延期必须晚于原结束时间')
+        start = parse_boundary(p['start_date'])
+        for other in periods(conn, p['billing_unit_id']):
+            if other['id'] != period_id and period_overlaps(other, start, end):
+                raise ValueError('延期与已有租期重叠，请先核对续费周期')
+        conn.execute('UPDATE account_periods SET end_date=? WHERE id=?', (end.isoformat(), period_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def automatic_boundaries(conn, unit_id):
+    row = conn.execute('SELECT s.* FROM org_subscriptions s JOIN billing_units u ON u.org_id=s.org_id '
+                       'WHERE u.id=?', (unit_id,)).fetchone()
+    if not row or not row['started_at'] or not row['expires_at']:
+        raise ValueError('未能确认该组织首期开始时间，请填写 YYYY-MM-DDTHH:MM；到期时间可在 /units 查看')
+    return tuple(datetime.fromtimestamp(row[k] / 1000, BILLING_TZ) for k in ('started_at', 'expires_at'))
 
 
 # ------------------------------------------------------------------ 出账
@@ -181,8 +263,8 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
         for p in periods(conn, aid):
             if not period_overlaps(p, start, end):
                 continue
-            p_start, p_end = parse_date(p["start_date"]), parse_date(p["end_date"])
-            s_ms, e_ms = day_start_ms(p_start), day_end_ms(p_end)
+            s_ms, exclusive_end = period_bounds(p)
+            e_ms = exclusive_end - 1
             covered_ranges.setdefault(aid, []).append((s_ms, e_ms))
             usage = weighted_usage(conn, aid, s_ms, e_ms)
             for m, w in usage["unrated_models"].items():
@@ -194,7 +276,7 @@ def compute(conn, start: date | None = None, end: date | None = None) -> dict:
             # 分摊分母必须包含未归属用量，否则未归属那份会被转嫁给已归属用户
             denom = total_w + unassigned_w
             cost = float(p["cost_cny"])
-            status = "provisional" if p_end >= today() else "final"
+            status = "provisional" if exclusive_end > int(time.time() * 1000) else "final"
             # 未定价统计先做：整期只有 pending 时 denom=0，若放在后面的分摊分支里会被跳过
             pend = pending_stats(conn, aid, s_ms, e_ms)
             if pend["requests"]:
@@ -294,7 +376,7 @@ def assign_legacy_period(conn, period_id: int, unit_id: str):
     if not conn.execute("SELECT 1 FROM billing_units WHERE id=?", (unit_id,)).fetchone():
         raise ValueError("未知计费账号，使用 /units 查看")
     for p in periods(conn, unit_id):
-        if period_overlaps(p, parse_date(row["start_date"]), parse_date(row["end_date"])):
+        if period_overlaps(p, parse_boundary(row["start_date"]), parse_boundary(row["end_date"])):
             raise ValueError("目标计费账号已有重叠租期")
     conn.execute("UPDATE account_periods SET account_id=?,billing_unit_id=? WHERE id=?",
                  (unit_id, unit_id, period_id))

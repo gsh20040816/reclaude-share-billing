@@ -77,8 +77,8 @@ def cmd_period_assign(args):
 
 def cmd_period_add(args) -> None:
     rt = _rt(args)
-    pid = billing.add_period(rt.conn, args.unit, billing.parse_date(args.start),
-                             billing.parse_date(args.end), float(args.cost),
+    pid = billing.add_period(rt.conn, args.unit, billing.parse_boundary(args.start),
+                             billing.parse_boundary(args.end), float(args.cost),
                              idle_split=args.idle_split)
     print(f"period #{pid} 已记录")
     rt.close()
