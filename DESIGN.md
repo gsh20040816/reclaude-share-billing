@@ -91,7 +91,7 @@
 
 ```
 for account in accounts(status=ok):
-    since = max(watermark.last_synced_at - OVERLAP, now - BACKFILL_MAX)
+    since = max(0, watermark.last_synced_at - OVERLAP) if watermark else 0
     until = now
     page  = history?limit=200&since=..&until=..
     loop:
@@ -112,7 +112,7 @@ for account in accounts(status=ok):
 参数建议：
 - 轮询间隔 `SYNC_INTERVAL = 5min`
 - `OVERLAP = 10min`（兜住乱序落库/延迟可见）
-- `BACKFILL_MAX = 24h`（水位丢失时的最大回补，防止一次拉爆）
+- 首次从 `since=0` 拉取上游保留的全部历史；每轮页数有上限，持久化 cursor 继续采集，读完才推进水位。
 - `PRICE_BACKFILL_WINDOW = 24h`，超过仍 pending 的记录标记 `stale`，账单里单列
 
 **幂等性**：请求 `id` 是主键，重复拉取不会重复计费。用户要求"拉到本地后不再重复拉取"——

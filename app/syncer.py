@@ -152,8 +152,8 @@ def _window(conn, account_id: str, since_ms=None, until_ms=None) -> tuple[int, i
     wm = conn.execute("SELECT last_synced_at FROM watermarks WHERE account_id=?",
                       (account_id,)).fetchone()
     overlap = store.get_int(conn, "sync_overlap_minutes", 10) * 60_000
-    backfill = store.get_int(conn, "backfill_max_hours", 24) * 3_600_000
-    since = (wm["last_synced_at"] - overlap) if (wm and wm["last_synced_at"]) else (now - backfill)
+    # A missing watermark means bootstrap ALL available upstream history.
+    since = (wm["last_synced_at"] - overlap) if (wm and wm["last_synced_at"]) else 0
     return max(0, int(since)), int(now)
 
 

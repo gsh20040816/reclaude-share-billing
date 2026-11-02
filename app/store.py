@@ -174,7 +174,6 @@ DEFAULTS = {
     "min_idle_minutes": "30",
     "sync_interval_seconds": "300",
     "sync_overlap_minutes": "10",
-    "backfill_max_hours": "24",
     "price_backfill_hours": "24",
     "stale_hours": "24",
     "default_multiplier": "1.0",
@@ -198,6 +197,13 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     for k, v in DEFAULTS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?,?)", (k, v))
+    # Older installations bootstrapped only 24h. Reset collection metadata once,
+    # preserving requests, bindings and invoices; request IDs make the replay idempotent.
+    migrated = conn.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES ('full_history_bootstrap_v1','1')")
+    if migrated.rowcount:
+        conn.execute("DELETE FROM watermarks")
+        conn.execute("DELETE FROM sync_progress")
     conn.commit()
 
 
