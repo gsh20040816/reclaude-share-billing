@@ -1,0 +1,7 @@
+{
+  "bot_token": "",
+  "admin_ids": [2039687026],
+  "allowed_chat_ids": [2039687026],
+  "base_url": "https://www.reclaude.ai",
+  "dry_run": true
+}

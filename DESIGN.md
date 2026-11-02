@@ -1,7 +1,7 @@
 # ReClaude 多账号合租计费系统 — 设计文档
 
-版本：v1.0（2026-11-02）
-状态：设计定稿，待实现
+版本：v1.1（2026-11-02）
+状态：设计定稿并已实现（见 README 与 `app/`）
 形态：Telegram Bot（管理员 / 用户两种角色）+ SQLite + 定时采集器
 
 **已确认的参数**：轮询 5 分钟、`MIN_IDLE` 30 分钟、倍率按模型全局配置、计费为租期成本按加权用量分摊（不加价）、入口只做 Telegram Bot。
@@ -494,3 +494,25 @@ pricing_status, deduction_status, platform, updated_at`
 **P3**
 - 网页自助（如果用户量上来，Telegram 输入链接变瓶颈）
 - pending 记录的本地定价估算
+
+---
+
+## 10. 实现状态（v1.1）
+
+| 设计条目 | 代码 |
+|---|---|
+| 会话池（锁 / cookie 回写 / 401 重登） | `app/sessions.py` |
+| 增量采集 + 归因 + 补价 | `app/syncer.py` |
+| 选账号 + approve + 登记设备 + `/bind` | `app/enroll.py` |
+| 闲置门槛 + LRU 下线 + 下线前定向采集 | `app/evictor.py` |
+| 模型倍率 + 租期成本分摊 + 账单快照 | `app/billing.py` |
+| Telegram Bot（管理员/用户/白名单/演练） | `app/bot.py` |
+| 运维 CLI（同一套 core） | `app/cli.py` |
+| 离线测试（FakeClient） | `tests/test_core.py`（7 个，全绿） |
+
+**验收对账**：真实账号 7 天窗口采集 11,241 条请求；按设备汇总与后台 `usage/stats` 的
+`total_usd` 逐台一致（差额 0.0000），含两台已撤销、已从设备列表消失的设备。
+
+**未实现 / 有意留白**：MFA 账号自动登录；Telegram 满员排队（state 几分钟即过期，实际做法是让用户重发）；
+全员账单的收款闭环；`pricing_status` 中 `ignored` / `not_billable` 的本地重算（现直接排除）。
+

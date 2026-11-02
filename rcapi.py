@@ -119,6 +119,24 @@ class RcClient:
             q.append(f"org_id={org_id}")
         return self.get("/api/app/usage/stats?" + "&".join(q)) or {}
 
+    def history(self, since: int | None = None, until: int | None = None,
+                cursor: str | None = None, limit: int = 200,
+                device_id: int | None = None, **extra):
+        """请求流水。limit 上限 200；翻页只能靠 next_cursor；device_id 只接受单个数字。"""
+        q = [f"limit={min(limit, 200)}"]
+        if since is not None:
+            q.append(f"since={int(since)}")
+        if until is not None:
+            q.append(f"until={int(until)}")
+        if cursor:
+            q.append("cursor=" + urllib.parse.quote(str(cursor)))
+        if device_id is not None:
+            q.append(f"device_id={int(device_id)}")
+        for k, v in extra.items():
+            if v is not None:
+                q.append(f"{k}={urllib.parse.quote(str(v))}")
+        return self.get("/api/app/history/messages?" + "&".join(q)) or {}
+
     # ------------------------------------------------------------ mutating
     def revoke_device(self, rc_id: int):
         return self.post(f"/api/app/devices/{rc_id}/revoke")
