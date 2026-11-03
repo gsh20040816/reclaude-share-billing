@@ -256,11 +256,15 @@ def init(conn: sqlite3.Connection) -> None:
         "requests": [("upstream_account_id", "INTEGER"), ("billing_unit_id", "TEXT")],
         "account_periods": [("billing_unit_id", "TEXT")],
         "invoice_lines": [("billing_unit_id", "TEXT")],
+        "invoices": [("billing_unit_id", "TEXT"), ("subscription_period_id", "INTEGER")],
     }.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, kind in columns:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    migrated = conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('period_invoices_v1','1')")
+    if migrated.rowcount:
+        conn.execute("UPDATE invoices SET status='legacy' WHERE subscription_period_id IS NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_req_device_activity ON requests(org_id,rc_device_id,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_req_unit_time ON requests(billing_unit_id,created_at)")
     migrated = conn.execute(

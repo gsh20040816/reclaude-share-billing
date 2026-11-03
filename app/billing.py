@@ -394,22 +394,23 @@ def create_invoices(conn, bill: dict, note: str | None = None) -> list[int]:
     for line in bill["periods"]:
         if line["user_id"] is None:
             continue
-        by_user.setdefault(line["user_id"], []).append(line)
+        by_user.setdefault((line["period_id"], line["billing_unit_id"], line["user_id"]), []).append(line)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-    # 同一区间重复出账时覆盖旧快照，避免 /report save 点两次就出两套账单
-    old = conn.execute("SELECT id FROM invoices WHERE period_start=? AND period_end=? AND status!='legacy'",
-                       (bill["start"], bill["end"])).fetchall()
-    for r in old:
-        conn.execute("DELETE FROM invoice_lines WHERE invoice_id=?", (r["id"],))
-        conn.execute("DELETE FROM invoices WHERE id=?", (r["id"],))
-    for uid, lines in by_user.items():
-        total = round(sum(l["amount_cny"] for l in lines), 2)
+    # Refresh each selected subscription period independently of report filters.
+    conn.execute("UPDATE settings SET value=value WHERE key='period_invoices_v1'")
+    for pid in {line['period_id'] for line in bill['periods']}:
+        old = conn.execute("SELECT id FROM invoices WHERE subscription_period_id=? AND status!='legacy'", (pid,)).fetchall()
+        for row in old:
+            conn.execute('DELETE FROM invoice_lines WHERE invoice_id=?', (row['id'],))
+            conn.execute('DELETE FROM invoices WHERE id=?', (row['id'],))
+    for (pid, unit_id, uid), lines in by_user.items():
+        total = round(sum(l['amount_cny'] for l in lines), 2)
         cur = conn.execute(
-            """INSERT INTO invoices(user_id, period_start, period_end, total_cny, status, created_at, note)
-               VALUES (?,?,?,?,?,?,?)""",
-            (uid, bill["start"], bill["end"], total,
-             "provisional" if any(l["status"] == "provisional" for l in lines) else "final",
-             stamp, note))
+            """INSERT INTO invoices(user_id,period_start,period_end,total_cny,status,created_at,note,
+                                    billing_unit_id,subscription_period_id) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (uid, lines[0]['start'], lines[0]['end'], total,
+             'provisional' if any(l['status']=='provisional' for l in lines) else 'final',
+             stamp, note, unit_id, pid))
         inv_id = cur.lastrowid
         ids.append(inv_id)
         for l in lines:

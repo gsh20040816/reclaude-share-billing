@@ -391,14 +391,14 @@ class Bot:
         mine = [p for p in bill["periods"] if p["user_id"] == uid]
         if not mine:
             lines.append("这段时间没有用量。")
-        total = 0.0
         for p in mine:
-            total += p["amount_cny"]
+            lines = [f"<b>我的订阅周期账单 #{p['period_id']}</b>"]
             lines.append(f"• {p['account_id']} {p['start']}~{p['end']} · "
                          f"加权 {p['weighted']:.2f} · 单价 {money(p['unit_price'])} → "
                          f"<b>{money(p['amount_cny'])}</b> [{p['status']}]")
-        lines += ["", f"合计 <b>{money(total)}</b>"]
-        self.tg.send(chat["id"], "\n".join(lines), thread)
+            self.tg.send(chat["id"], "\n".join(lines), thread)
+        if not mine:
+            self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_login(self, chat, msg, uid, args, thread) -> None:
         if not args:
@@ -711,21 +711,36 @@ class Bot:
                 except Exception:                # noqa: BLE001
                     pass
         bill = billing.compute(self.conn, start, end)
-        lines = [f"<b>账单</b> {start} ~ {end}", ""]
-        users = sorted(bill["users"].items(), key=lambda kv: -kv[1])
-        if users:
-            for u, amt in users:
-                handle = self.conn.execute("SELECT handle FROM users WHERE tg_user_id=?",
-                                           (u,)).fetchone()
-                lines.append(f"• {esc(handle['handle']) if handle and handle['handle'] else 'tg:' + str(u)}"
-                             f" · <b>{money(amt)}</b>")
-            lines.append(f"合计 <b>{money(sum(a for _, a in users))}</b>")
-        else:
-            lines.append("这段时间没有可分摊的用量。")
-        lines.append("")
-        for p in bill["periods"]:
-            if p["user_id"] is None:
-                lines.append(f"⚠️ <code>{p['account_id']}</code> {p['start']}~{p['end']} {p['note']}")
+        grouped = {}
+        for line in bill['periods']:
+            grouped.setdefault(line['period_id'], []).append(line)
+        for pid, entries in grouped.items():
+            p = entries[0]
+            status = '暂估（周期未结束）' if p['status'] == 'provisional' else '周期已结束'
+            lines = [f"<b>订阅周期账单 #{pid}</b> · {status}",
+                     f"计费席位：<code>{esc(p['billing_unit_id'])}</code>",
+                     f"{esc(p['start'])} ~ {esc(p['end'])}",
+                     f"本期成本：<b>{money(p['cost_cny'])}</b>"]
+            assigned = pending = 0.0
+            for entry in entries:
+                u, amount = entry['user_id'], entry['amount_cny']
+                if u is None:
+                    pending += amount
+                    if entry['note']:
+                        lines.append(f"⚠️ {esc(entry['note'])}")
+                else:
+                    assigned += amount
+                    person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (u,)).fetchone()
+                    name = person['handle'] if person and person['handle'] else f'tg:{u}'
+                    lines.append(f"• {esc(name)} · <b>{money(amount)}</b>")
+            lines.append(f"本期已归属：{money(assigned)} · 待认领：{money(pending)}")
+            if p['total_weighted'] <= 0:
+                lines.append('本期无可分摊用量，成本尚未分配。')
+            self.tg.send(chat['id'], '\n'.join(lines), thread)
+        lines = [f"<b>账单数据检查</b> · 筛选 {start} ~ {end}",
+                 '日期仅筛选相交订阅周期，各周期独立按整期用量计算。']
+        if not grouped:
+            lines.append('没有匹配的订阅周期。')
         an = bill["anomalies"]
         if an.get("legacy_periods"):
             lines.append("⚠️ 旧成本尚未指定到订阅账号，请 /periods 查看并 /period assign。")
@@ -734,7 +749,7 @@ class Bot:
         if an["incomplete"]:
             lines.append("\n<b>缺租期</b>")
             for x in an["incomplete"]:
-                lines.append(f"• <code>{x['account_id']}</code> {x['requests']} 条请求未定价")
+                lines.append(f"• <code>{x['account_id']}</code> {x['requests']} 条请求尚未配置租期成本")
         if an["uncovered"]:
             lines.append("\n<b>租期外请求</b>")
             for x in an["uncovered"]:
