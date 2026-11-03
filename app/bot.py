@@ -90,7 +90,22 @@ class Bot:
 
     def allowed_chat(self, chat: dict, uid: int) -> bool:
         if chat.get("type") == "private":
-            return not self.allowed or chat["id"] in self.allowed or uid in self.admins
+            if not self.allowed or chat['id'] in self.allowed or uid in self.admins:
+                return True
+            # Verify on every private message; never persist group membership as
+            # permanent trust. API errors fail closed.
+            for group_id in sorted(g for g in self.allowed if g < 0):
+                try:
+                    response = self.tg.call('getChatMember', chat_id=group_id, user_id=uid)
+                    member = response.get('result') or {}
+                    if response.get('ok') and (
+                        member.get('status') in ('creator', 'administrator', 'member') or
+                        (member.get('status') == 'restricted' and member.get('is_member') is True)
+                    ):
+                        return True
+                except Exception:
+                    continue
+            return False
         return chat["id"] in self.allowed
 
     # ---------------------------------------------------------------- 主循环
