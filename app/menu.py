@@ -13,6 +13,7 @@ USER_COMMANDS = [
     ("cancel", "取消当前操作"),
 ]
 ADMIN_COMMANDS = [
+    ("quota", "账号额度 · 窗口用量及容量估算"),
     ("accounts", "登录账号池 · 状态与席位"),
     ("units", "计费账号 · 组织下的订阅与成本"),
     ("account_add", "添加账号 · 按提示填写"),

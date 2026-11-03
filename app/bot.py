@@ -13,7 +13,7 @@ import urllib.request
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 
-from . import billing, enroll, evictor, store, syncer, ledger, activity
+from . import billing, enroll, evictor, store, syncer, ledger, activity, quota
 from .runtime import Runtime
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -134,7 +134,7 @@ class Bot:
     def command_lane(upd):
         parts = ((upd.get('message') or {}).get('text') or '').split()
         command = parts[0].split('@')[0].lower() if parts else ''
-        if command == '/sync':
+        if command in ('/sync', '/quota'):
             return 'sync'
         if command in {'/id', '/start', '/help', '/me', '/devices', '/bill', '/units',
                        '/accounts', '/periods', '/rates', '/health'}:
@@ -222,7 +222,7 @@ class Bot:
         cmd = parts[0].split("@")[0].lower()
         args = parts[1:]
         handler = {
-            "/id": self.cmd_id, "/start": self.cmd_help, "/help": self.cmd_help,
+            "/quota": self.cmd_quota, "/id": self.cmd_id, "/start": self.cmd_help, "/help": self.cmd_help,
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
@@ -236,7 +236,7 @@ class Bot:
         if handler is None:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
-        if cmd in ("/renew", "/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
+        if cmd in ("/quota", "/renew", "/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
                    "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
                    "/dryrun") \
                 and not self.is_admin(uid):
@@ -270,6 +270,7 @@ class Bot:
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
                       "• <code>/accounts</code> 登录账号池状态",
+                      "• <code>/quota [账号] [refresh]</code> 额度与窗口容量估算",
                       "• <code>/devices</code> 活跃设备；<code>/devices all</code> 含历史；<code>/devices mine</code> 个人设备",
                       "• <code>/units</code> 组织下的计费账号（计费单元ID）",
                       "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
@@ -681,6 +682,42 @@ class Bot:
                                  f"（历史请求也一并改归）", thread)
 
     # ---------------------------------------------------------------- 管理员：采集/账单
+    def cmd_quota(self, chat, msg, uid, args, thread):
+        refresh = 'refresh' in args
+        labels = [a for a in args if a != 'refresh']
+        if len(labels) > 1:
+            raise ValueError('用法：/quota [账号] [refresh]')
+        accounts = [a for a in store.enabled_accounts(self.conn) if not labels or a['id']==labels[0]]
+        if not accounts:
+            raise ValueError('没有匹配的启用账号')
+        self.tg.send(chat['id'], '⏳ 正在查询账号额度…', thread)
+        for account in accounts:
+            try:
+                org, windows = quota.fetch(self.pool,self.conn,account['id'],refresh)
+                lines = [f"<b>{esc(account['id'])} · 组织 {org['id']} 额度</b>"]
+                for w in windows:
+                    pct = f"{w['percent']:g}%" if w['percent'] is not None else '未知'
+                    lines.append(f"\n<b>{w['label']}：已用 {pct}</b>")
+                    if w['end']:
+                        lines.append(f"重置：{store.iso(w['end'])}")
+                    if w['observed']:
+                        lines.append(f"快照：{store.iso(w['observed'])}")
+                    lines.append(f"窗口已采集：{w['requests']} 请求 · {w['tokens']:,} tokens · {usd(w['usd'])}")
+                    if w['estimate'] is not None:
+                        lines.append(f"估算总容量 ≈ {usd(w['estimate'])}，剩余 ≈ {usd(w['remaining'])}（上游标价等值）")
+                    else:
+                        lines.append('暂不估算：' + '；'.join(w['reasons']))
+                snapshot = (org.get('current_account') or {}).get('usage_snapshot') or {}
+                for limit in snapshot.get('limits') or []:
+                    if limit.get('kind') == 'weekly_scoped':
+                        model = ((limit.get('scope') or {}).get('model') or {}).get('display_name') or '细分模型'
+                        lines.append(f"细分额度 {esc(model)}：{esc(limit.get('percent'))}%（不反推容量）")
+                lines.append('窗口起点按重置时间减 5 小时/7 天推算；用量截止快照时刻。')
+                lines.append('估算=已采集上游标价用量÷使用率，仅供参考；未必覆盖其他客户端用量，不是官方美元额度或账单成本。')
+                self.tg.send(chat['id'], '\n'.join(lines), thread)
+            except Exception as exc:
+                self.tg.send(chat['id'], f"{esc(account['id'])} 查询失败：{esc(str(exc)[:200])}", thread)
+
     def cmd_sync(self, chat, msg, uid, args, thread) -> None:
         only = [args[0]] if args else None
         self.tg.send(chat["id"], "⏳ 采集中…", thread)
