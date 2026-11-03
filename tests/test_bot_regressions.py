@@ -214,3 +214,27 @@ def test_cli_account_add_rolls_back_when_period_fails(tmp_path, monkeypatch):
         cli.cmd_account_add(_cli_args(db))
     assert "登录凭据不配置成本" in str(exc.value)
     _assert_cli_account_absent(db, "cli-a")
+
+
+def test_devices_existing_user_does_not_wait_for_writer(bot):
+    import sqlite3
+    bot.handle({'message': _msg(text='/devices')})
+    path = bot.conn.execute('PRAGMA database_list').fetchone()[2]
+    writer = sqlite3.connect(path)
+    writer.execute('BEGIN IMMEDIATE')
+    bot.conn.execute('PRAGMA busy_timeout=10')
+    try:
+        bot.handle({'message': _msg(text='/devices')})
+    finally:
+        writer.rollback()
+        writer.close()
+    assert bot.tg.sent
+
+
+def test_user_handle_updates_without_changing_role(bot):
+    bot.handle({'message': _msg(text='/id')})
+    msg = _msg(text='/id')
+    msg['from']['username'] = 'newname'
+    bot.handle({'message': msg})
+    row = bot.conn.execute('SELECT handle,role FROM users WHERE tg_user_id=?', (ADMIN,)).fetchone()
+    assert row['handle'] == '@newname' and row['role'] == 'admin'

@@ -191,13 +191,15 @@ class Bot:
         text = msg["text"].strip()
         thread = msg.get("message_thread_id")
 
-        # Keep display names current without changing existing roles or status.
-        self.conn.execute(
-            "INSERT INTO users(tg_user_id, handle, role, status, created_at) "
-            "VALUES (?,?,?, 'active', ?) ON CONFLICT(tg_user_id) DO UPDATE SET handle=excluded.handle",
-            (uid, ("@" + user["username"]) if user.get("username") else (user.get("first_name") or str(uid)),
-             "admin" if uid in self.admins else "user", store.iso()))
-        self.conn.commit()
+        # Read commands must not contend for SQLite's writer lock on every message.
+        handle = ("@" + user["username"]) if user.get("username") else (user.get("first_name") or str(uid))
+        person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (uid,)).fetchone()
+        if person is None or person['handle'] != handle:
+            self.conn.execute(
+                "INSERT INTO users(tg_user_id, handle, role, status, created_at) "
+                "VALUES (?,?,?, 'active', ?) ON CONFLICT(tg_user_id) DO UPDATE SET handle=excluded.handle",
+                (uid, handle, "admin" if uid in self.admins else "user", store.iso()))
+            self.conn.commit()
 
         # Read-only and sync commands do not mutate multi-step conversation state.
         # All flow steps and state-changing commands share one ordered writer.
@@ -372,7 +374,8 @@ class Bot:
         suffix = '，含历史记录' if include_history else ''
         lines = [f'<b>{title}</b>（{len(devs)} 台{suffix}）']
         for d in devs:
-            last = time.strftime('%m-%d %H:%M', time.localtime((activity.latest(self.conn, d) or 0) / 1000)) if activity.latest(self.conn, d) else '无记录'
+            last_used = activity.latest(self.conn, d)
+            last = time.strftime('%m-%d %H:%M', time.localtime(last_used / 1000)) if last_used else '无记录'
             block = [f"• <b>{esc(self.device_display_name(d))}</b>",
                      f"   编号：<code>{d['rc_device_id']}</code> · 入口 {esc(d['account_id'])}",
                      f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
