@@ -84,7 +84,7 @@ def test_report_and_rates_render(bot):
 def test_user_cannot_run_admin_commands(bot):
     bot.allowed.add(555)
     chat = _msg(uid=555)["chat"]
-    bot.command(chat, _msg(uid=555), 555, "/accounts", None)
+    bot.command(chat, _msg(uid=555), 555, "/account_add", None)
     assert any("仅管理员" in s for s in bot.tg.sent)
 
 

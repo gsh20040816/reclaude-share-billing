@@ -20,7 +20,7 @@ def test_membership_error_denied_and_no_admin_escalation(bot):
  bot.tg.call=Mock(return_value={'ok':False})
  assert not bot.allowed_chat({'id':555,'type':'private'},555)
  bot.tg.call.return_value={'ok':True,'result':{'status':'administrator'}}
- bot.handle({'message':_msg(uid=555,text='/revoke 54426')})
+ bot.handle({'message':_msg(uid=555,text='/account_add')})
  assert '仅管理员' in bot.tg.sent[-1]
  assert bot.conn.execute('SELECT role FROM users WHERE tg_user_id=555').fetchone()[0]=='user'
  assert not bot.allowed_chat({'id':-999,'type':'group'},555)

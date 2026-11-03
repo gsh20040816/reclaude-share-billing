@@ -13,6 +13,8 @@ def test_menus_limit_admin_commands_to_authorized_scopes(bot):
     calls = [c.kwargs for c in bot.tg.call.call_args_list if c.args[0] == 'setMyCommands']
     public = next(c for c in calls if c['scope']['type'] == 'default')
     assert 'account_add' not in {c['command'] for c in public['commands']}
+    assert {'devices','accounts','quota','units','report','bind','revoke'} <= {c['command'] for c in public['commands']}
+    assert all(len(c['commands']) == len({x['command'] for x in c['commands']}) for c in calls)
     assert len(calls) == 3
     for c in calls:
         if c['scope']['type'] != 'default':

@@ -237,8 +237,8 @@ class Bot:
         if handler is None:
             self.tg.send(chat["id"], "未知命令，发 /help 看用法。", thread)
             return
-        if cmd in ("/quota", "/renew", "/unit_link", "/units", "/accounts", "/account_add", "/account_del", "/period", "/periods",
-                   "/rate", "/rates", "/revoke", "/bind", "/sync", "/report", "/health",
+        if cmd in ("/renew", "/unit_link", "/account_add", "/account_del", "/period", "/periods",
+                   "/rate", "/rates", "/sync", "/health",
                    "/dryrun") \
                 and not self.is_admin(uid):
             self.tg.send(chat["id"], "⛔ 仅管理员可用。", thread)
@@ -263,17 +263,20 @@ class Bot:
                  "<b>用户</b>",
                  "• <code>/login &lt;授权链接&gt;</code> 登记本机（reclaude login 打印的链接）",
                  "• <code>/me</code> 我的设备与本月账单",
-                 "• <code>/devices</code> 我的设备列表",
+
                  "• <code>/bill [起] [止]</code> 我的账单明细",
                  "• <code>/id</code> 查看用户、聊天和话题 ID",
                  "• <code>/help</code> 本帮助",
                  "• <code>/cancel</code> 取消当前操作"]
+        lines += ["• <code>/accounts</code> 登录账号池状态",
+                  "• <code>/quota [账号] [refresh]</code> 额度与窗口容量估算",
+                  "• <code>/devices</code> 活跃设备；<code>/devices all</code> 含历史；<code>/devices mine</code> 个人设备",
+                  "• <code>/units</code> 组织下的计费账号（计费单元ID）",
+                  "• <code>/revoke &lt;设备ID&gt;</code> 下线设备",
+                  "• <code>/bind &lt;设备ID&gt; &lt;tg_user_id&gt;</code> 手工归因",
+                  "• <code>/report [起] [止] [save]</code> 全员账单"]
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
-                      "• <code>/accounts</code> 登录账号池状态",
-                      "• <code>/quota [账号] [refresh]</code> 额度与窗口容量估算",
-                      "• <code>/devices</code> 活跃设备；<code>/devices all</code> 含历史；<code>/devices mine</code> 个人设备",
-                      "• <code>/units</code> 组织下的计费账号（计费单元ID）",
                       "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
                       "• <code>/period add &lt;计费单元ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
@@ -283,10 +286,7 @@ class Bot:
                       "• 手动时间：YYYY-MM-DDTHH:MM（北京时间）",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
-                      "• <code>/revoke &lt;设备ID&gt;</code> 下线设备",
-                      "• <code>/bind &lt;设备ID&gt; &lt;tg_user_id&gt;</code> 手工归因",
                       "• <code>/sync [账号]</code> 立即采集",
-                      "• <code>/report [起] [止] [save]</code> 全员账单",
                       "• <code>/dryrun on|off</code> 写操作演练开关",
                       "• <code>/health</code> 账号/采集健康"]
         self.tg.send(chat["id"], "\n".join(lines), thread)
@@ -342,13 +342,10 @@ class Bot:
 
     def cmd_devices(self, chat, msg, uid, args, thread) -> None:
         if args and args not in (['mine'], ['all']):
-            self.tg.send(chat['id'], '用法：/devices 查看活跃设备；/devices all 查看全部（管理员）；/devices mine 查看自己的活跃设备。', thread)
-            return
-        if args == ['all'] and not self.is_admin(uid):
-            self.tg.send(chat['id'], '⛔ 仅管理员可查看全部设备。', thread)
+            self.tg.send(chat['id'], '用法：/devices 查看活跃设备；/devices all 查看全部；/devices mine 查看自己的活跃设备。', thread)
             return
         include_history = args == ['all']
-        show_all = self.is_admin(uid) and args != ['mine']
+        show_all = args != ['mine']
         if show_all:
             # One physical device may be visible through multiple credentials.
             # Prefer its owning organization login for the actionable /bind key.
@@ -657,9 +654,13 @@ class Bot:
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
             return
+        device = self.conn.execute('SELECT user_id FROM devices WHERE account_id=? AND rc_device_id=?', (aid, did)).fetchone()
+        if not self.is_admin(uid) and (device is None or device['user_id'] != uid):
+            self.tg.send(chat['id'], '只能下线自己的设备。', thread)
+            return
         dry = bool(self.cfg.get("dry_run", True))
         try:
-            plan = evictor.evict(self.pool, self.conn, aid, did, reason="admin", actor=f"tg:{uid}",
+            plan = evictor.evict(self.pool, self.conn, aid, did, reason="admin" if self.is_admin(uid) else "manual", actor=f"tg:{uid}",
                                  dry_run=dry, force=True)
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
@@ -675,6 +676,13 @@ class Bot:
             return
         try:
             aid, did = self._resolve_device(args[0])
+            if not self.is_admin(uid):
+                device = self.conn.execute('SELECT org_id,user_id FROM devices WHERE account_id=? AND rc_device_id=?', (aid, did)).fetchone()
+                owners = self.conn.execute('SELECT user_id FROM devices WHERE org_id IS ? AND rc_device_id=? AND user_id IS NOT NULL',
+                                           (device['org_id'], did)).fetchall() if device else []
+                if device is None or int(args[1]) != uid or any(r['user_id'] != uid for r in owners):
+                    self.tg.send(chat['id'], '只能认领未绑定设备；改绑请联系管理员。', thread)
+                    return
             enroll.bind_device(self.conn, aid, did, int(args[1]))
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)

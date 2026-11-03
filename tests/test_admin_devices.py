@@ -19,14 +19,14 @@ def test_admin_sees_unbound_and_history_and_deduplicates(bot):
     assert 'tg:555' in text
 
 
-def test_nonadmin_cannot_read_others_and_admin_mine_is_scoped(bot):
+def test_shared_devices_and_mine_is_scoped(bot):
     add(bot,'a1',100,1,555)
     add(bot,'a1',101,1,ADMIN)
     msg=_msg(uid=555)
     bot.command(msg['chat'],msg,555,'/devices',None)
-    assert 'device-100' in bot.tg.sent[-1] and 'device-101' not in bot.tg.sent[-1]
+    assert 'device-100' in bot.tg.sent[-1] and 'device-101' in bot.tg.sent[-1]
     bot.command(msg['chat'],msg,555,'/devices all',None)
-    assert '仅管理员' in bot.tg.sent[-1]
+    assert 'device-101' in bot.tg.sent[-1]
     bot.command(_msg()['chat'],_msg(),ADMIN,'/devices mine',None)
     assert 'device-101' in bot.tg.sent[-1] and 'device-100' not in bot.tg.sent[-1]
 
@@ -60,3 +60,35 @@ def test_short_id_resolution_prefers_active_own_entry_and_rejects_ambiguity(bot)
     add(bot,'third',100,2)
     with pytest.raises(ValueError,match='歧义'):
         bot._resolve_device('100')
+
+
+def test_revoke_ownership_and_bind_cannot_steal(bot, monkeypatch):
+    from app import evictor
+    add(bot,'a1',100,1,ADMIN)
+    add(bot,'a1',101,1,555)
+    add(bot,'a1',102,1,None)
+    calls=[]
+    monkeypatch.setattr(evictor,'evict',lambda *a,**kw: calls.append((a,kw)) or {'flush':{}})
+    msg=_msg(uid=555)
+    bot.command(msg['chat'],msg,555,'/revoke 100',None)
+    assert not calls and '只能下线自己的' in bot.tg.sent[-1]
+    bot.command(msg['chat'],msg,555,'/bind 100 555',None)
+    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=100').fetchone()[0]==ADMIN
+    bot.command(msg['chat'],msg,555,'/bind 102 555',None)
+    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=102').fetchone()[0]==555
+    bot.command(msg['chat'],msg,555,'/revoke 101',None)
+    assert len(calls)==1 and calls[-1][1]['reason']=='manual'
+    bot.command(_msg()['chat'],_msg(),ADMIN,'/revoke 101',None)
+    assert len(calls)==2
+
+
+def test_shared_queries_have_identical_output(bot, monkeypatch):
+    from app import quota
+    monkeypatch.setattr(quota,'fetch',lambda *a,**kw: ({'id':1},[]))
+    for command in ('/devices','/accounts','/quota','/units','/report'):
+        bot.tg.sent.clear()
+        bot.command(_msg()['chat'],_msg(),ADMIN,command,None)
+        expected=list(bot.tg.sent)
+        bot.tg.sent.clear()
+        bot.command(_msg(uid=555)['chat'],_msg(uid=555),555,command,None)
+        assert bot.tg.sent==expected

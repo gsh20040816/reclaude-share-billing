@@ -154,7 +154,7 @@ def test_bot_exposes_unit_costs_and_protects_admin_commands(bot):
     bot.command(chat, _msg(), ADMIN, '/period add a1 2026-12-01 2026-12-31 100', None)
     assert '登录标签' in bot.tg.sent[-1]
     bot.command(_msg(uid=555)['chat'], _msg(uid=555), 555, '/units', None)
-    assert '仅管理员' in bot.tg.sent[-1]
+    assert '25693:seat1' in bot.tg.sent[-1]
 
 
 def test_cli_cost_target_is_subscription_key():
