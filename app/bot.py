@@ -257,8 +257,8 @@ class Bot:
                       "• 手动时间：YYYY-MM-DDTHH:MM（北京时间，结束时刻不包含）",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
-                      "• <code>/revoke &lt;账号:设备id&gt;</code> 下线设备",
-                      "• <code>/bind &lt;账号:设备id&gt; &lt;tg_user_id&gt;</code> 手工归因",
+                      "• <code>/revoke &lt;设备ID&gt;</code> 下线设备",
+                      "• <code>/bind &lt;设备ID&gt; &lt;tg_user_id&gt;</code> 手工归因",
                       "• <code>/sync [账号]</code> 立即采集",
                       "• <code>/report [起] [止] [save]</code> 全员账单",
                       "• <code>/dryrun on|off</code> 写操作演练开关",
@@ -348,7 +348,7 @@ class Bot:
         for d in devs:
             last = time.strftime('%m-%d %H:%M', time.localtime((activity.latest(self.conn, d) or 0) / 1000)) if activity.latest(self.conn, d) else '无记录'
             block = [f"• <b>{esc(self.device_display_name(d))}</b>",
-                     f"   操作编号：<code>{esc(d['account_id'])}:{d['rc_device_id']}</code>",
+                     f"   编号：<code>{d['rc_device_id']}</code> · 入口 {esc(d['account_id'])}",
                      f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
             if show_all:
                 block.append(f"   归属：tg:{d['user_id']}" if d['user_id'] is not None else '   归属：未绑定')
@@ -357,7 +357,7 @@ class Bot:
                 lines = [f'<b>{title}（续）</b>']
             lines.extend(block)
         if show_all:
-            lines.append('绑定归属：/bind 账号:设备ID Telegram用户ID\n只修改归属，不会撤销设备。')
+            lines.append('绑定归属：/bind 设备ID Telegram用户ID\n只修改归属，不会撤销设备。')
         self.tg.send(chat['id'], '\n'.join(lines), thread)
 
     def cmd_bill(self, chat, msg, uid, args, thread) -> None:
@@ -608,15 +608,21 @@ class Bot:
         if ":" in spec:
             aid, did = spec.split(":", 1)
             return aid, int(did)
-        row = self.conn.execute("SELECT account_id, rc_device_id FROM devices WHERE rc_device_id=?",
-                                (int(spec),)).fetchone()
-        if not row:
+        rows = self.conn.execute("""SELECT d.*,a.enabled,a.own_org_id FROM devices d
+            LEFT JOIN rc_accounts a ON a.id=d.account_id WHERE d.rc_device_id=?
+            ORDER BY CASE WHEN d.state='active' THEN 0 ELSE 1 END,
+                     CASE WHEN a.enabled=1 THEN 0 ELSE 1 END,
+                     CASE WHEN d.org_id=a.own_org_id THEN 0 ELSE 1 END,d.account_id""",
+            (int(spec),)).fetchall()
+        if not rows:
             raise ValueError(f"找不到设备 {spec}")
-        return row["account_id"], row["rc_device_id"]
+        if len({r['org_id'] for r in rows}) > 1:
+            raise ValueError('设备编号归属有歧义，请使用 账号:设备ID 指定入口')
+        return rows[0]['account_id'], rows[0]['rc_device_id']
 
     def cmd_revoke(self, chat, msg, uid, args, thread) -> None:
         if not args:
-            self.tg.send(chat["id"], "用法：<code>/revoke &lt;账号:设备id&gt;</code>", thread)
+            self.tg.send(chat["id"], "用法：<code>/revoke &lt;设备ID&gt;</code>", thread)
             return
         try:
             aid, did = self._resolve_device(args[0])
@@ -637,7 +643,7 @@ class Bot:
 
     def cmd_bind(self, chat, msg, uid, args, thread) -> None:
         if len(args) < 2:
-            self.tg.send(chat["id"], "用法：<code>/bind &lt;账号:设备id&gt; &lt;tg_user_id&gt;</code>", thread)
+            self.tg.send(chat["id"], "用法：<code>/bind &lt;设备ID&gt; &lt;tg_user_id&gt;</code>", thread)
             return
         try:
             aid, did = self._resolve_device(args[0])

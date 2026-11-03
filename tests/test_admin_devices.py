@@ -15,7 +15,7 @@ def test_admin_sees_unbound_and_history_and_deduplicates(bot):
     text='\n'.join(bot.tg.sent)
     assert '全部设备' in text and '未绑定' in text and 'missing' in text
     assert text.count('device-100')==1
-    assert 'a1:100' in text
+    assert '编号：<code>100</code>' in text
     assert 'tg:555' in text
 
 
@@ -49,3 +49,14 @@ def test_default_excludes_history_but_all_includes_it(bot):
     assert 'device-101' not in text and 'device-102' not in text
     bot.command(_msg()['chat'],_msg(),ADMIN,'/devices all',None)
     assert all('device-'+str(i) in bot.tg.sent[-1] for i in (100,101,102))
+
+
+def test_short_id_resolution_prefers_active_own_entry_and_rejects_ambiguity(bot):
+    import pytest
+    add(bot,'other',100,1)
+    add(bot,'a1',100,1)
+    assert bot._resolve_device('100')==('a1',100)
+    assert bot._resolve_device('other:100')==('other',100)
+    add(bot,'third',100,2)
+    with pytest.raises(ValueError,match='歧义'):
+        bot._resolve_device('100')
