@@ -290,10 +290,25 @@ class Bot:
                      "evicting": "下线中", "unknown": "未认领"}.get(d["state"], d["state"])
             last = time.strftime("%m-%d %H:%M", time.localtime((activity.latest(self.conn, d) or 0) / 1000)) \
                 if activity.latest(self.conn, d) else "从未"
-            lines.append(f"• <code>{d['account_id']}:{d['rc_device_id']}</code> {state} · 最近 {last}")
+            lines.append(f"• <b>{esc(self.device_display_name(d))}</b> · {state} · 最近 {last}")
         if not devs:
             lines.append("• 还没有设备，发 /login &lt;授权链接&gt; 登记")
         self.tg.send(chat["id"], "\n".join(lines), thread)
+
+    def device_display_name(self, device):
+        name = device['name'] or ''
+        if name.startswith('rcb-'):
+            login = self.conn.execute(
+                "SELECT hostname,os,arch FROM login_states WHERE account_id=? "
+                "AND status='approved' AND note=? ORDER BY created_at DESC LIMIT 1",
+                (device['account_id'], f"device_id={device['rc_device_id']}")).fetchone()
+            if login and login['hostname']:
+                platform = ' · '.join(str(login[k]) for k in ('os', 'arch') if login[k])
+                return login['hostname'] + (f' · {platform}' if platform else '')
+            name = re.sub(r'^rcb-[0-9a-f]+\s*', '', name)
+        if not name or name == f"unknown-{device['rc_device_id']}":
+            return '名称未知（历史设备）'
+        return name
 
     def cmd_devices(self, chat, msg, uid, args, thread) -> None:
         if args and args not in (['mine'], ['all']):
@@ -332,7 +347,8 @@ class Bot:
             lines.append('数据来自最近采集；/sync 刷新。active 表示登录有效，不代表正在使用。')
         for d in devs:
             last = time.strftime('%m-%d %H:%M', time.localtime((activity.latest(self.conn, d) or 0) / 1000)) if activity.latest(self.conn, d) else '无记录'
-            block = [f"• <code>{esc(d['account_id'])}:{d['rc_device_id']}</code> {esc(d['name'])}",
+            block = [f"• <b>{esc(self.device_display_name(d))}</b>",
+                     f"   操作编号：<code>{esc(d['account_id'])}:{d['rc_device_id']}</code>",
                      f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
             if show_all:
                 block.append(f"   归属：tg:{d['user_id']}" if d['user_id'] is not None else '   归属：未绑定')
