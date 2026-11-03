@@ -5,11 +5,11 @@ import json
 import secrets
 import time
 
-from . import evictor, store, ledger
+from . import store, allocation, ledger
 
 
-class NoSlot(Exception):
-    """所有账号都满，且没有满足闲置门槛的设备可以下线。"""
+class NoSlot(allocation.NoCapacity):
+    """没有满足容量和额度条件的账号；分配绝不触发撤销。"""
 
 
 class EnrollError(Exception):
@@ -44,7 +44,7 @@ def free_account(conn):
 
 
 def pick_account(conn, preferred: str | None = None, exclude: set[int] | None = None):
-    """-> (account_row, victim_row|None)。victim 不为空表示需要先下线。
+    """Legacy local-capacity helper. Never chooses a victim.
 
     preferred 是硬约束：只允许用这一个账号，不能回退到账号池里的其他账号。
     """
@@ -56,17 +56,9 @@ def pick_account(conn, preferred: str | None = None, exclude: set[int] | None = 
         acc = accounts[0]
         if used_slots(conn, acc["id"]) < account_capacity(conn, acc["id"]):
             return acc, None
-        victim = evictor.choose_victim(conn, acc["id"], exclude=exclude)
-        return (acc, victim) if victim is not None else (None, None)
+        return None, None
     free = free_account(conn)
-    if free:
-        return free, None
-    # 没有空位 → 找一台可下线的
-    for acc in accounts:
-        victim = evictor.choose_victim(conn, acc["id"], exclude=exclude)
-        if victim is not None:
-            return acc, victim
-    return None, None
+    return free, None
 
 
 def describe(pool, conn, state: str, account_id: str) -> dict:
@@ -79,25 +71,20 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
            actor: str | None = None, max_wait: float = 30.0) -> dict:
     from . import syncer
 
-    acc, victim = pick_account(conn, preferred_account)
-    if acc is None:
-        raise NoSlot("所有已启用账号都满员，且没有满足闲置门槛的设备可下线")
-
-    info = describe(pool, conn, state, acc["id"])
-    with pool.session(acc["id"]) as session:
-        org_id = ledger.discover(conn, acc["id"], session.get("/api/app/orgs/"), session.device_quota())
-    if org_id is None:
-        raise EnrollError("无法确认登录账号的自有组织，停止分配")
+    try:
+        selected = allocation.choose(pool, conn, preferred_account)
+    except allocation.NoCapacity as exc:
+        raise NoSlot(str(exc)) from exc
+    acc = store.account_row(conn, selected['account_id'])
+    org_id = selected['org_id']
+    info = describe(pool, conn, state, acc['id'])
     plan = {
-        "account_id": acc["id"], "org_id": org_id, "device_name": device_name,
-        "hostname": info.get("hostname"), "os": info.get("os"), "arch": info.get("arch"),
-        "expires_at": info.get("expires_at"), "victim": victim["rc_device_id"] if victim else None,
+        "account_id": acc['id'], "org_id": org_id, "device_name": device_name,
+        "hostname": info.get('hostname'), "os": info.get('os'), "arch": info.get('arch'),
+        "expires_at": info.get('expires_at'), "victim": None,
         "dry_run": dry_run, "device_id": None, "pending": False,
+        "allocation": selected,
     }
-    if victim is not None:
-        plan["evict"] = evictor.evict(pool, conn, acc["id"], victim["rc_device_id"],
-                                      reason=f"make room for {device_name}", actor=actor,
-                                      dry_run=dry_run)
 
     if dry_run:
         store.event(conn, "enroll_dry_run", actor=actor, account_id=acc["id"], detail=plan)
