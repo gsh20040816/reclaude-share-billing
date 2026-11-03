@@ -18,3 +18,51 @@ def test_window_scope_and_estimate(env):
  assert quota.summarize(c,'a1',org,now)[0]['estimate'] is None
  org['current_account']['usage_snapshot']['five_hour']['utilization']=25
  assert quota.summarize(c,'a1',org,now+16*60000)[0]['estimate'] is None
+
+
+def test_weighted_estimate_includes_pending_without_blocking(env):
+ rt,_=env;c=rt.conn;now=store.now_ms()
+ c.execute('INSERT INTO watermarks(account_id,last_synced_at) VALUES (?,?)',('a1',now))
+ c.executemany('INSERT INTO model_rates(pattern,multiplier,updated_at) VALUES (?,?,?)',
+               [('claude-*',2,store.iso()),('claude-exact',3,store.iso())])
+ c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('default_multiplier','4')")
+ for rid,model,cost in [(1,'claude-exact',10),(2,'claude-other',10),(3,'other',10),(4,'other',None)]:
+  syncer._upsert_request(c,'a1',dict(id=rid,org_id=1,account_id=101,device_id=100,created_at=now-1,
+   model=model,cost_total_usd=cost,pricing_status='priced' if cost else 'pending',total_tokens=100))
+ org={'id':1,'current_account':{'id':101,'usage_updated_at':now,'usage_snapshot':{
+  'five_hour':{'utilization':25,'resets_at':now+3600000}}}}
+ w=quota.summarize(c,'a1',org,now)[0]
+ assert w['raw_usd']==30 and w['usd']==90
+ assert w['estimate']==360 and w['remaining']==270
+ assert w['unpriced']==1 and not w['reasons']
+ assert w['requests']==4 and w['tokens']==400 and w['percent']==25
+
+
+def test_expired_snapshot_refreshes_before_sync(env, monkeypatch):
+ rt,_=env;c=rt.conn;now=store.now_ms();calls=[]
+ def fetch_org(pool,login_id,refresh=False):
+  calls.append(('fetch',refresh))
+  return {'id':1,'current_account':{'id':101,'usage_updated_at':now if refresh else now-3600000,
+   'usage_snapshot':{key:{'utilization':25,'resets_at':now+3600000}
+                     for key in ('five_hour','seven_day')}}}
+ def sync(pool,conn,login_id):
+  calls.append(('sync',login_id))
+  conn.execute('INSERT OR REPLACE INTO watermarks(account_id,last_synced_at) VALUES (?,?)',(login_id,now))
+  syncer._upsert_request(conn,login_id,dict(id=1,org_id=1,account_id=101,device_id=100,created_at=now-1,
+   cost_total_usd=10,pricing_status='priced'))
+ monkeypatch.setattr(quota,'_fetch_org',fetch_org)
+ monkeypatch.setattr(syncer,'sync_account',sync)
+ monkeypatch.setattr(syncer,'backfill_prices',lambda *a:calls.append(('backfill',)))
+ _,windows=quota.fetch(rt.pool,c,'a1')
+ assert calls==[('fetch',False),('fetch',True),('sync','a1'),('backfill',)]
+ assert windows[0]['estimate']==40
+ calls.clear()
+ quota.fetch(rt.pool,c,'a1',refresh=True)
+ assert calls==[('fetch',True),('backfill',)]
+
+ def fail_backfill(*args):
+  raise RuntimeError('upstream unavailable')
+ c.commit()
+ monkeypatch.setattr(syncer,'backfill_prices',fail_backfill)
+ _,windows=quota.fetch(rt.pool,c,'a1',refresh=True)
+ assert windows[0]['estimate']==40 and windows[0]['backfill_failed']

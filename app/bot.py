@@ -702,9 +702,13 @@ class Bot:
                         lines.append(f"重置：{store.iso(w['end'])}")
                     if w['observed']:
                         lines.append(f"快照：{store.iso(w['observed'])}")
-                    lines.append(f"窗口已采集：{w['requests']} 请求 · {w['tokens']:,} tokens · {usd(w['usd'])}")
+                    lines.append(f"窗口已采集：{w['requests']} 请求 · {w['tokens']:,} tokens · 加权 {usd(w['usd'])}（原始 {usd(w['raw_usd'])}）")
+                    if w.get('backfill_failed'):
+                        lines.append('⚠️ 本次自动补价失败，使用已采集金额估算。')
+                    if w['unpriced']:
+                        lines.append(f"⚠️ {w['unpriced']} 条请求尚未定价，暂未计入金额；容量估算可能偏低。")
                     if w['estimate'] is not None:
-                        lines.append(f"估算总容量 ≈ {usd(w['estimate'])}，剩余 ≈ {usd(w['remaining'])}（上游标价等值）")
+                        lines.append(f"估算总容量 ≈ {usd(w['estimate'])}，剩余 ≈ {usd(w['remaining'])}（自定义倍率加权等值）")
                     else:
                         lines.append('暂不估算：' + '；'.join(w['reasons']))
                 snapshot = (org.get('current_account') or {}).get('usage_snapshot') or {}
@@ -713,7 +717,7 @@ class Bot:
                         model = ((limit.get('scope') or {}).get('model') or {}).get('display_name') or '细分模型'
                         lines.append(f"细分额度 {esc(model)}：{esc(limit.get('percent'))}%（不反推容量）")
                 lines.append('窗口起点按重置时间减 5 小时/7 天推算；用量截止快照时刻。')
-                lines.append('估算=已采集上游标价用量÷使用率，仅供参考；未必覆盖其他客户端用量，不是官方美元额度或账单成本。')
+                lines.append('估算=Σ(模型用量×自定义倍率)÷使用率，模型组合变化会影响估算；未必覆盖其他客户端用量，不是官方美元额度或账单成本。')
                 self.tg.send(chat['id'], '\n'.join(lines), thread)
             except Exception as exc:
                 self.tg.send(chat['id'], f"{esc(account['id'])} 查询失败：{esc(str(exc)[:200])}", thread)
