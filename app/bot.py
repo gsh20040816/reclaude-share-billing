@@ -246,7 +246,7 @@ class Bot:
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
                       "• <code>/accounts</code> 登录账号池状态",
-                      "• <code>/devices</code> 全部设备；<code>/devices mine</code> 个人设备",
+                      "• <code>/devices</code> 活跃设备；<code>/devices all</code> 含历史；<code>/devices mine</code> 个人设备",
                       "• <code>/units</code> 组织下的计费账号（计费单元ID）",
                       "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
@@ -297,11 +297,12 @@ class Bot:
 
     def cmd_devices(self, chat, msg, uid, args, thread) -> None:
         if args and args not in (['mine'], ['all']):
-            self.tg.send(chat['id'], '用法：/devices；管理员可用 /devices mine 查看自己的设备。', thread)
+            self.tg.send(chat['id'], '用法：/devices 查看活跃设备；/devices all 查看全部（管理员）；/devices mine 查看自己的活跃设备。', thread)
             return
         if args == ['all'] and not self.is_admin(uid):
             self.tg.send(chat['id'], '⛔ 仅管理员可查看全部设备。', thread)
             return
+        include_history = args == ['all']
         show_all = self.is_admin(uid) and args != ['mine']
         if show_all:
             # One physical device may be visible through multiple credentials.
@@ -317,13 +318,16 @@ class Bot:
                 d['state'] != 'active', d['org_id'] or 0, d['rc_device_id']))
         else:
             devs = self._user_devices(uid)
+        if not include_history:
+            devs = [d for d in devs if d['state'] == 'active']
         if not devs:
-            text = ('尚未采集到设备，请 /sync 后重试。' if show_all else
+            text = ('没有符合条件的设备；可 /sync 刷新，或 /devices all 查看历史记录。' if show_all else
                     '没有绑定到你的设备；已登录设备可能尚未认领，请联系管理员绑定，无需重新登录。')
             self.tg.send(chat['id'], text, thread)
             return
-        title = '全部设备' if show_all else '我的设备'
-        lines = [f'<b>{title}</b>（{len(devs)} 台，含历史记录）']
+        title = ('全部设备' if include_history else '活跃设备') if show_all else '我的活跃设备'
+        suffix = '，含历史记录' if include_history else ''
+        lines = [f'<b>{title}</b>（{len(devs)} 台{suffix}）']
         if show_all:
             lines.append('数据来自最近采集；/sync 刷新。active 表示登录有效，不代表正在使用。')
         for d in devs:
