@@ -38,7 +38,7 @@ def test_full_never_calls_revoke_or_approve(env):
     assert not any(p.endswith('/approve') or p.endswith('/revoke') for p,b in state.posts)
 
 
-def test_selects_other_accessible_org_and_approves_that_org(env):
+def test_only_own_org_even_when_joined_org_has_more_quota(env):
     rt,state=env
     original=FakeClient.get
     def get(client,path):
@@ -49,6 +49,19 @@ def test_selects_other_accessible_org_and_approves_that_org(env):
         return original(client,path)
     with patch.object(FakeClient,'get',get):
         result=enroll.enroll(rt.pool,rt.conn,state='test',tg_user_id=111,device_name='test',dry_run=False,max_wait=0)
-    assert result['org_id']==2
-    assert next(b for p,b in state.posts if p.endswith('/approve'))['org_id']==2
+    assert result['org_id']==1
+    assert next(b for p,b in state.posts if p.endswith('/approve'))['org_id']==1
     assert not any(p.endswith('/revoke') for p,b in state.posts)
+
+
+def test_unknown_ownership_never_allocates(env):
+    rt,state=env
+    del state.quota['account_org_id']
+    assert allocation.collect(rt.pool,rt.conn)[0] == []
+    assert not state.posts
+
+
+def test_full_own_org_does_not_fall_back_to_joined_org(env):
+    rt,state=env
+    state.quota['account_used']=state.quota['account_max']
+    assert allocation.collect(rt.pool,rt.conn)[0] == []

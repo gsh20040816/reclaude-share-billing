@@ -69,7 +69,11 @@ def collect(pool, conn, preferred=None):
             continue
         try:
             with pool.session(login['id']) as s:
-                orgs = s.get('/api/app/orgs/').get('items', [])
+                quota = s.device_quota()
+                own_org = quota.get('account_org_id')
+                if own_org is None:
+                    continue  # unknown ownership must never fall back to a joined org
+                orgs = [o for o in s.get('/api/app/orgs/').get('items', []) if o['id'] == own_org]
                 # Refresh stale upstream snapshots; this is not a model request.
                 for org in orgs:
                     if pressure(org.get('current_account') or {}, now) is None and (org.get('actions') or {}).get('usage_refresh'):
@@ -77,8 +81,10 @@ def collect(pool, conn, preferred=None):
                             s.post(f"/api/app/account/usage/refresh?org_id={int(org['id'])}")
                         except Exception:
                             pass
-                orgs = s.get('/api/app/orgs/').get('items', [])
+                orgs = [o for o in s.get('/api/app/orgs/').get('items', []) if o['id'] == own_org]
                 quota, devices = s.device_quota(), s.devices()
+                if quota.get('account_org_id') != own_org:
+                    continue
             # Credential-level limit and own-account limit are different scopes.
             platform = next((p for p in quota.get('by_platform', []) if p.get('platform') == 'claude'), quota)
             used, cap = number(platform.get('used')), number(platform.get('max'))
@@ -93,11 +99,8 @@ def collect(pool, conn, preferred=None):
                 if org.get('subscription_expires_at') and org['subscription_expires_at'] <= now:
                     continue
                 available = used < cap
-                if quota.get('account_org_id') == org['id']:
-                    au, ac = number(quota.get('account_used')), number(quota.get('account_max'))
-                    available = available and au is not None and ac is not None and au < ac
-                # Other organizations' account-wide cap is not returned by this
-                # endpoint. Upstream approval remains authoritative for those.
+                au, ac = number(quota.get('account_used')), number(quota.get('account_max'))
+                available = available and au is not None and ac is not None and au < ac
                 tier = account.get('subscription_type')
                 scale = store.get_float(conn, f'allocation_capacity:{tier}', {'max_5x':5, 'max_20x':20}.get(tier, 1))
                 scale = scale if math.isfinite(scale) and scale > 0 else 1
