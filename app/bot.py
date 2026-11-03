@@ -13,7 +13,7 @@ import urllib.request
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 
-from . import billing, enroll, evictor, store, syncer, ledger
+from . import billing, enroll, evictor, store, syncer, ledger, activity
 from .runtime import Runtime
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -288,8 +288,8 @@ class Bot:
         for d in devs[:10]:
             state = {"active": "在线", "missing": "已消失", "revoked": "已下线",
                      "evicting": "下线中", "unknown": "未认领"}.get(d["state"], d["state"])
-            last = time.strftime("%m-%d %H:%M", time.localtime((d["last_used_at"] or 0) / 1000)) \
-                if d["last_used_at"] else "从未"
+            last = time.strftime("%m-%d %H:%M", time.localtime((activity.latest(self.conn, d) or 0) / 1000)) \
+                if activity.latest(self.conn, d) else "从未"
             lines.append(f"• <code>{d['account_id']}:{d['rc_device_id']}</code> {state} · 最近 {last}")
         if not devs:
             lines.append("• 还没有设备，发 /login &lt;授权链接&gt; 登记")
@@ -327,12 +327,12 @@ class Bot:
         if show_all:
             lines.append('数据来自最近采集；/sync 刷新。active 表示登录有效，不代表正在使用。')
         for d in devs:
-            last = time.strftime('%m-%d %H:%M', time.localtime((d['last_used_at'] or 0) / 1000)) if d['last_used_at'] else '无记录'
+            last = time.strftime('%m-%d %H:%M', time.localtime((activity.latest(self.conn, d) or 0) / 1000)) if activity.latest(self.conn, d) else '无记录'
             block = [f"• <code>{esc(d['account_id'])}:{d['rc_device_id']}</code> {esc(d['name'])}",
                      f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
             if show_all:
                 block.append(f"   归属：tg:{d['user_id']}" if d['user_id'] is not None else '   归属：未绑定')
-            if len('\n'.join(lines + block)) > 3400:
+            if len('\n'.join(lines + block)) > 3200:
                 self.tg.send(chat['id'], '\n'.join(lines), thread)
                 lines = [f'<b>{title}（续）</b>']
             lines.extend(block)

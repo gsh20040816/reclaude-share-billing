@@ -261,6 +261,7 @@ def init(conn: sqlite3.Connection) -> None:
         for name, kind in columns:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_req_device_activity ON requests(org_id,rc_device_id,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_req_unit_time ON requests(billing_unit_id,created_at)")
     migrated = conn.execute(
         "INSERT OR IGNORE INTO settings(key,value) VALUES ('subscription_ledger_v1','1')")

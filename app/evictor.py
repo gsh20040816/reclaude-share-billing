@@ -1,7 +1,7 @@
 """抢占式下线：闲置门槛 + 最久不用优先 + 下线前定向采集。"""
 from __future__ import annotations
 
-from . import store, syncer
+from . import store, syncer, activity
 from .sessions import serialized_account
 
 
@@ -27,11 +27,11 @@ def candidates(conn, account_id: str, min_idle: int | None = None,
     for r in rows:
         if r["rc_device_id"] in exclude:
             continue
-        last = r["last_used_at"] or 0
+        last = activity.latest(conn, r) or 0
         if last and now - last < idle:
             continue
         out.append(r)
-    return out
+    return sorted(out, key=lambda r: activity.latest(conn, r) or 0)
 
 
 def choose_victim(conn, account_id: str, **kw):
@@ -60,8 +60,9 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
         raise EvictionError(f"设备 {rc_device_id} 不在本地库")
     if row["state"] == "revoked":
         return {"ok": True, "skipped": "已经撤销"}
-    if not force and row["last_used_at"]:
-        idle = store.now_ms() - row["last_used_at"]
+    effective_last = activity.latest(conn, row)
+    if not force and effective_last:
+        idle = store.now_ms() - effective_last
         if idle < min_idle_ms(conn):
             raise EvictionError(
                 f"设备 {rc_device_id} 最近 {idle // 60000} 分钟内有使用，"
@@ -118,12 +119,17 @@ def _check_live_idle(pool, conn, account_id, device_id):
     device = next((d for d in devices if int(d.get("id", -1)) == device_id), None)
     if device is None:
         raise EvictionError("设备已不在上游列表，取消自动撤销")
-    last = device.get("last_used_at") or device.get("created_at")
-    if not isinstance(last, (int, float)):
-        raise EvictionError("无法确认设备闲置时间，取消自动撤销")
-    recent = conn.execute("SELECT MAX(created_at) FROM requests WHERE account_id=? AND rc_device_id=?",
-                          (account_id, device_id)).fetchone()[0]
-    last = max(last, recent or 0)
+    row = conn.execute('SELECT * FROM devices WHERE account_id=? AND rc_device_id=?',
+                       (account_id, device_id)).fetchone()
+    if device.get('org_id') is not None and row['org_id'] is not None and device['org_id'] != row['org_id']:
+        raise EvictionError('设备组织发生变化，取消自动撤销')
+    last = activity.latest(conn, row, device.get('last_used_at'))
+    # Creation time is a conservative idle guard, not a displayed use time.
+    created = device.get('created_at')
+    if isinstance(created, (int, float)):
+        last = max(last or 0, created)
+    if last is None:
+        raise EvictionError('无法确认设备闲置时间，取消自动撤销')
     conn.execute("UPDATE devices SET last_used_at=? WHERE account_id=? AND rc_device_id=?",
                  (last, account_id, device_id))
     conn.commit()
