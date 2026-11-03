@@ -5,6 +5,9 @@ from . import store, syncer, activity
 from .sessions import serialized_account
 
 
+REQUEST_PROTECTION_MS = 90 * 60_000
+
+
 class EvictionError(Exception):
     pass
 
@@ -27,11 +30,15 @@ def candidates(conn, account_id: str, min_idle: int | None = None,
     for r in rows:
         if r["rc_device_id"] in exclude:
             continue
-        last = activity.latest(conn, r) or 0
-        if last and now - last < idle:
+        request = activity.last_request(conn, r)
+        if request is not None and now-request <= REQUEST_PROTECTION_MS:
             continue
-        out.append(r)
-    return sorted(out, key=lambda r: activity.latest(conn, r) or 0)
+        upstream = r['last_used_at']
+        if upstream and now-upstream >= idle:
+            out.append((0, upstream, r))
+        elif request is not None and now-request > max(idle, REQUEST_PROTECTION_MS):
+            out.append((1, request, r))
+    return [r for _, _, r in sorted(out, key=lambda item: (item[0], item[1], item[2]['rc_device_id']))]
 
 
 def choose_victim(conn, account_id: str, **kw):
@@ -60,13 +67,9 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
         raise EvictionError(f"设备 {rc_device_id} 不在本地库")
     if row["state"] == "revoked":
         return {"ok": True, "skipped": "已经撤销"}
-    effective_last = activity.latest(conn, row)
-    if not force and effective_last:
-        idle = store.now_ms() - effective_last
-        if idle < min_idle_ms(conn):
-            raise EvictionError(
-                f"设备 {rc_device_id} 最近 {idle // 60000} 分钟内有使用，"
-                f"未达闲置门槛 {min_idle_ms(conn) // 60000} 分钟")
+    manual_override = force and reason in ('manual', 'admin')
+    if not manual_override:
+        _check_request_guard(conn, row)
 
     conn.execute("UPDATE devices SET state='evicting' WHERE account_id=? AND rc_device_id=?",
                  (account_id, rc_device_id))
@@ -84,7 +87,9 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
         return plan
 
     try:
-        if not force:
+        if not manual_override:
+            if flush.get('error') or any((flush.get(k) or {}).get('truncated') for k in ('first', 'second')):
+                raise EvictionError('请求同步未完成，取消自动撤销')
             _check_live_idle(pool, conn, account_id, rc_device_id)
         with pool.session(account_id) as s:
             s.revoke(rc_device_id)
@@ -123,15 +128,24 @@ def _check_live_idle(pool, conn, account_id, device_id):
                        (account_id, device_id)).fetchone()
     if device.get('org_id') is not None and row['org_id'] is not None and device['org_id'] != row['org_id']:
         raise EvictionError('设备组织发生变化，取消自动撤销')
-    last = activity.latest(conn, row, device.get('last_used_at'))
-    # Creation time is a conservative idle guard, not a displayed use time.
+    request = activity.last_request(conn, row)
+    _check_request_guard(conn, row)
+    upstream = device.get('last_used_at')
+    now = store.now_ms()
+    # Heartbeats affect first-choice ranking, not the real-request protection.
+    upstream_idle = isinstance(upstream, (int, float)) and upstream > 0 and now-upstream >= min_idle_ms(conn)
+    request_idle = request is not None and now-request > max(min_idle_ms(conn), REQUEST_PROTECTION_MS)
     created = device.get('created_at')
-    if isinstance(created, (int, float)):
-        last = max(last or 0, created)
-    if last is None:
-        raise EvictionError('无法确认设备闲置时间，取消自动撤销')
+    if isinstance(created, (int, float)) and now-created <= REQUEST_PROTECTION_MS:
+        raise EvictionError('设备刚创建，取消自动撤销')
+    if not upstream_idle and not request_idle:
+        raise EvictionError('设备尚未满足闲置条件')
     conn.execute("UPDATE devices SET last_used_at=? WHERE account_id=? AND rc_device_id=?",
-                 (last, account_id, device_id))
+                 (upstream, account_id, device_id))
     conn.commit()
-    if store.now_ms() - last < min_idle_ms(conn):
-        raise EvictionError("设备最近仍有使用，取消自动撤销")
+
+
+def _check_request_guard(conn, device):
+    request = activity.last_request(conn, device)
+    if request is not None and store.now_ms()-request <= REQUEST_PROTECTION_MS:
+        raise EvictionError('最近 90 分钟内有请求，不能自动下线')
