@@ -246,6 +246,7 @@ class Bot:
         if self.is_admin(uid):
             lines += ["", "<b>管理员</b>",
                       "• <code>/accounts</code> 登录账号池状态",
+                      "• <code>/devices</code> 全部设备；<code>/devices mine</code> 个人设备",
                       "• <code>/units</code> 组织下的计费账号（计费单元ID）",
                       "• <code>/account_add</code> 添加登录凭据（邮箱→密码→标签）",
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
@@ -295,17 +296,49 @@ class Bot:
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_devices(self, chat, msg, uid, args, thread) -> None:
-        devs = self._user_devices(uid)
-        if not devs:
-            self.tg.send(chat["id"], "没有设备。发 /login &lt;授权链接&gt; 登记。", thread)
+        if args and args not in (['mine'], ['all']):
+            self.tg.send(chat['id'], '用法：/devices；管理员可用 /devices mine 查看自己的设备。', thread)
             return
-        lines = ["<b>我的设备</b>"]
+        if args == ['all'] and not self.is_admin(uid):
+            self.tg.send(chat['id'], '⛔ 仅管理员可查看全部设备。', thread)
+            return
+        show_all = self.is_admin(uid) and args != ['mine']
+        if show_all:
+            # One physical device may be visible through multiple credentials.
+            # Prefer its owning organization login for the actionable /bind key.
+            rows = self.conn.execute("""SELECT d.*, a.own_org_id FROM devices d
+                LEFT JOIN rc_accounts a ON a.id=d.account_id
+                ORDER BY CASE WHEN d.org_id=a.own_org_id THEN 0 ELSE 1 END,
+                         d.account_id,d.rc_device_id""").fetchall()
+            unique = {}
+            for d in rows:
+                unique.setdefault((d['org_id'], d['rc_device_id']), d)
+            devs = sorted(unique.values(), key=lambda d: (
+                d['state'] != 'active', d['org_id'] or 0, d['rc_device_id']))
+        else:
+            devs = self._user_devices(uid)
+        if not devs:
+            text = ('尚未采集到设备，请 /sync 后重试。' if show_all else
+                    '没有绑定到你的设备；已登录设备可能尚未认领，请联系管理员绑定，无需重新登录。')
+            self.tg.send(chat['id'], text, thread)
+            return
+        title = '全部设备' if show_all else '我的设备'
+        lines = [f'<b>{title}</b>（{len(devs)} 台，含历史记录）']
+        if show_all:
+            lines.append('数据来自最近采集；/sync 刷新。active 表示登录有效，不代表正在使用。')
         for d in devs:
-            last = time.strftime("%m-%d %H:%M", time.localtime((d["last_used_at"] or 0) / 1000)) \
-                if d["last_used_at"] else "从未"
-            lines.append(f"• <code>{d['account_id']}:{d['rc_device_id']}</code> {esc(d['name'])}")
-            lines.append(f"   组织 {d['org_id'] or '待回补'} · 状态 {d['state']} · 最近使用 {last}")
-        self.tg.send(chat["id"], "\n".join(lines), thread)
+            last = time.strftime('%m-%d %H:%M', time.localtime((d['last_used_at'] or 0) / 1000)) if d['last_used_at'] else '无记录'
+            block = [f"• <code>{esc(d['account_id'])}:{d['rc_device_id']}</code> {esc(d['name'])}",
+                     f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
+            if show_all:
+                block.append(f"   归属：tg:{d['user_id']}" if d['user_id'] is not None else '   归属：未绑定')
+            if len('\n'.join(lines + block)) > 3400:
+                self.tg.send(chat['id'], '\n'.join(lines), thread)
+                lines = [f'<b>{title}（续）</b>']
+            lines.extend(block)
+        if show_all:
+            lines.append('绑定归属：/bind 账号:设备ID Telegram用户ID\n只修改归属，不会撤销设备。')
+        self.tg.send(chat['id'], '\n'.join(lines), thread)
 
     def cmd_bill(self, chat, msg, uid, args, thread) -> None:
         start, end = self._parse_range(args)

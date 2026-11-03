@@ -50,7 +50,7 @@ def configure(bot):
     # Remember scopes before writing them, so a later restart can clean up partial success.
     store.set_setting(bot.conn, "telegram_menu_scopes", json.dumps(scopes))
     for scope in scopes:
-        call("setMyCommands", commands=commands(ADMIN_COMMANDS + USER_COMMANDS),
+        call("setMyCommands", commands=commands(ADMIN_COMMANDS + [(cmd, '全部设备 · 含未绑定与历史设备' if cmd == 'devices' else desc) for cmd, desc in USER_COMMANDS]),
              scope=scope, language_code="")
     call("setChatMenuButton", menu_button={"type": "commands"})
     for uid in sorted(bot.admins):
