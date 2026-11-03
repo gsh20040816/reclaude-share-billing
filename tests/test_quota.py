@@ -17,7 +17,7 @@ def test_window_scope_and_estimate(env):
  org['current_account']['usage_snapshot']['five_hour']['utilization']=100
  assert quota.summarize(c,'a1',org,now)[0]['estimate'] is None
  org['current_account']['usage_snapshot']['five_hour']['utilization']=25
- assert quota.summarize(c,'a1',org,now+16*60000)[0]['estimate'] is None
+ assert quota.summarize(c,'a1',org,now+31*60000)[0]['estimate'] is None
 
 
 def test_weighted_estimate_includes_pending_without_blocking(env):
@@ -40,9 +40,9 @@ def test_weighted_estimate_includes_pending_without_blocking(env):
 
 def test_expired_snapshot_refreshes_before_sync(env, monkeypatch):
  rt,_=env;c=rt.conn;now=store.now_ms();calls=[]
- def fetch_org(pool,login_id,refresh=False):
+ def fetch_org(pool,login_id,refresh=False,conn=None):
   calls.append(('fetch',refresh))
-  return {'id':1,'current_account':{'id':101,'usage_updated_at':now if refresh else now-3600000,
+  return {'id':1,'current_account':{'id':101,'usage_updated_at':now,
    'usage_snapshot':{key:{'utilization':25,'resets_at':now+3600000}
                      for key in ('five_hour','seven_day')}}}
  def sync(pool,conn,login_id):
@@ -54,7 +54,7 @@ def test_expired_snapshot_refreshes_before_sync(env, monkeypatch):
  monkeypatch.setattr(syncer,'sync_account',sync)
  monkeypatch.setattr(syncer,'backfill_prices',lambda *a:calls.append(('backfill',)))
  _,windows=quota.fetch(rt.pool,c,'a1')
- assert calls==[('fetch',False),('fetch',True),('sync','a1'),('backfill',)]
+ assert calls==[('fetch',False),('sync','a1'),('backfill',)]
  assert windows[0]['estimate']==40
  calls.clear()
  quota.fetch(rt.pool,c,'a1',refresh=True)
@@ -66,3 +66,43 @@ def test_expired_snapshot_refreshes_before_sync(env, monkeypatch):
  monkeypatch.setattr(syncer,'backfill_prices',fail_backfill)
  _,windows=quota.fetch(rt.pool,c,'a1',refresh=True)
  assert windows[0]['estimate']==40 and windows[0]['backfill_failed']
+
+
+def test_refresh_age_cooldown_and_failure(env, monkeypatch):
+ from app import quota_refresh
+ rt,_=env;c=rt.conn;now=store.now_ms();posts=[]
+ monkeypatch.setattr(store,'now_ms',lambda:now)
+ class Session:
+  def post(self,path):
+   posts.append(path)
+   raise RuntimeError('HTTP 429')
+ s=Session()
+ org={'id':1,'current_account':{'usage_updated_at':now-20*60000,
+      'usage_snapshot':{'five_hour':{'resets_at':None,'utilization':0}}}}
+ assert not quota_refresh.refresh_usage(s,c,org)
+ assert not posts
+ org['current_account']['usage_updated_at']=now-30*60000
+ assert not quota_refresh.refresh_usage(s,c,org)
+ assert not posts
+ now+=1
+ assert not quota_refresh.refresh_usage(s,c,org)
+ assert len(posts)==1
+ assert not quota_refresh.refresh_usage(s,c,org,force=True)
+ assert len(posts)==1
+ now+=30*60000
+ assert not quota_refresh.refresh_usage(s,c,org)
+ assert len(posts)==2
+
+
+def test_fetch_keeps_snapshot_when_refresh_limited(env, monkeypatch):
+ from contextlib import contextmanager
+ rt,_=env;c=rt.conn;now=store.now_ms()
+ org={'id':1,'current_account':{'usage_updated_at':now-3600000}}
+ class Session:
+  def device_quota(self):return {'account_org_id':1}
+  def get(self,path):return {'items':[org]}
+  def post(self,path):raise RuntimeError('HTTP 429')
+ class Pool:
+  @contextmanager
+  def session(self,login):yield Session()
+ assert quota._fetch_org(Pool(),'a1',conn=c)==org

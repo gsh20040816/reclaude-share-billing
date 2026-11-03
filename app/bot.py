@@ -741,9 +741,7 @@ class Bot:
             self.tg.send(chat["id"], "⏳ 刷新官方用量快照…", thread)
             for acc in store.enabled_accounts(self.conn):
                 try:
-                    with self.pool.session(acc["id"]) as s:
-                        s.post("/api/app/account/usage/refresh"
-                               + (f"?org_id={acc['own_org_id']}" if acc["own_org_id"] else ""))
+                    quota._fetch_org(self.pool, acc['id'], refresh=True, conn=self.conn)
                 except Exception:                # noqa: BLE001
                     pass
         bill = billing.compute(self.conn, start, end)

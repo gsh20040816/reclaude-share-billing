@@ -1,17 +1,7 @@
 """Quota snapshots and window usage estimates; never used as billing costs."""
-from datetime import datetime
 from . import store, billing, syncer
 from .allocation import number
-
-
-def timestamp(value):
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return int(value) if value > 0 else None
-    try:
-        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return int(dt.timestamp()*1000) if dt.tzinfo else None
-    except (AttributeError, ValueError, TypeError):
-        return None
+from .quota_refresh import timestamp, refresh_usage, INTERVAL_MS
 
 
 def summarize(conn, login_id, org, now=None):
@@ -42,7 +32,7 @@ def summarize(conn, login_id, org, now=None):
                    raw_usd=sum(u['usd'] for u in usage),
                    usd=sum(u['usd'] * billing.multiplier_for(rates,u['model'])[0] for u in usage))
         unpriced = sum(u['unpriced'] or 0 for u in usage)
-        if not 0 <= now-observed <= 15*60000 or end <= now:
+        if not 0 <= now-observed <= INTERVAL_MS or end <= now:
             row['reasons'].append('快照过期')
         if pending or not watermark or watermark[0] is None or watermark[0] < observed:
             row['reasons'].append('流水待同步')
@@ -58,31 +48,21 @@ def summarize(conn, login_id, org, now=None):
     return result
 
 
-def _fetch_org(pool, login_id, refresh=False):
+def _fetch_org(pool, login_id, refresh=False, conn=None):
     with pool.session(login_id) as session:
         own = session.device_quota().get('account_org_id')
         if own is None:
             raise ValueError('无法确认自有组织')
-        if refresh:
-            session.post(f'/api/app/account/usage/refresh?org_id={int(own)}')
         org = next((o for o in session.get('/api/app/orgs/').get('items',[]) if o['id']==own), None)
+        if org and conn is not None and refresh_usage(session, conn, org, force=refresh):
+            org = next((o for o in session.get('/api/app/orgs/').get('items',[]) if o['id']==own), org)
     if not org:
         raise ValueError('未找到自有组织')
     return org
 
 
 def fetch(pool, conn, login_id, refresh=False):
-    org = _fetch_org(pool, login_id, refresh)
-    account = org.get('current_account') or {}
-    observed = timestamp(account.get('usage_updated_at'))
-    now = store.now_ms()
-    snapshot = account.get('usage_snapshot') or {}
-    expired = observed is None or not 0 <= now-observed <= 15*60000
-    for key in ('five_hour', 'seven_day'):
-        end = timestamp((snapshot.get(key) or {}).get('resets_at'))
-        expired = expired or end is None or end <= now
-    if expired and not refresh:
-        org = _fetch_org(pool, login_id, True)
+    org = _fetch_org(pool, login_id, refresh, conn=conn)
     # Freeze the refreshed snapshot, then bring history up to its timestamp.
     # Re-fetching after sync could move the target ahead of the watermark forever.
     observed = timestamp((org.get('current_account') or {}).get('usage_updated_at'))

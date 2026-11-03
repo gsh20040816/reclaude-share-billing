@@ -2,6 +2,7 @@
 import math
 from datetime import datetime
 from . import store
+from .quota_refresh import refresh_usage
 
 
 class NoCapacity(Exception):
@@ -76,11 +77,7 @@ def collect(pool, conn, preferred=None):
                 orgs = [o for o in s.get('/api/app/orgs/').get('items', []) if o['id'] == own_org]
                 # Refresh stale upstream snapshots; this is not a model request.
                 for org in orgs:
-                    if pressure(org.get('current_account') or {}, now) is None and (org.get('actions') or {}).get('usage_refresh'):
-                        try:
-                            s.post(f"/api/app/account/usage/refresh?org_id={int(org['id'])}")
-                        except Exception:
-                            pass
+                    refresh_usage(s, conn, org)
                 orgs = [o for o in s.get('/api/app/orgs/').get('items', []) if o['id'] == own_org]
                 quota, devices = s.device_quota(), s.devices()
                 if quota.get('account_org_id') != own_org:
