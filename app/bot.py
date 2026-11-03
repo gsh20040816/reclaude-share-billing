@@ -191,14 +191,13 @@ class Bot:
         text = msg["text"].strip()
         thread = msg.get("message_thread_id")
 
-        # 首次接触自动登记用户
-        row = self.conn.execute("SELECT tg_user_id FROM users WHERE tg_user_id=?", (uid,)).fetchone()
-        if row is None:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO users(tg_user_id, handle, role, status, created_at) VALUES (?,?,?, 'active', ?)",
-                (uid, ("@" + user["username"]) if user.get("username") else (user.get("first_name") or str(uid)),
-                 "admin" if uid in self.admins else "user", store.iso()))
-            self.conn.commit()
+        # Keep display names current without changing existing roles or status.
+        self.conn.execute(
+            "INSERT INTO users(tg_user_id, handle, role, status, created_at) "
+            "VALUES (?,?,?, 'active', ?) ON CONFLICT(tg_user_id) DO UPDATE SET handle=excluded.handle",
+            (uid, ("@" + user["username"]) if user.get("username") else (user.get("first_name") or str(uid)),
+             "admin" if uid in self.admins else "user", store.iso()))
+        self.conn.commit()
 
         # Read-only and sync commands do not mutate multi-step conversation state.
         # All flow steps and state-changing commands share one ordered writer.
@@ -290,6 +289,10 @@ class Bot:
                       "• <code>/health</code> 账号/采集健康"]
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
+    def user_display_name(self, uid):
+        person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (uid,)).fetchone()
+        return person['handle'] if person and person['handle'] else f'tg:{uid}'
+
     def _user_devices(self, uid):
         return self.conn.execute(
             "SELECT * FROM devices WHERE user_id=? ORDER BY COALESCE(last_used_at,0) DESC",
@@ -374,7 +377,7 @@ class Bot:
                      f"   编号：<code>{d['rc_device_id']}</code> · 入口 {esc(d['account_id'])}",
                      f"   组织 {d['org_id'] or '待回补'} · 状态 {esc(d['state'])} · 最近使用 {last}"]
             if show_all:
-                block.append(f"   归属：tg:{d['user_id']}" if d['user_id'] is not None else '   归属：未绑定')
+                block.append(f"   归属：{esc(self.user_display_name(d['user_id']))}" if d['user_id'] is not None else '   归属：未绑定')
             if len('\n'.join(lines + block)) > 3200:
                 self.tg.send(chat['id'], '\n'.join(lines), thread)
                 lines = [f'<b>{title}（续）</b>']
@@ -675,8 +678,7 @@ class Bot:
             return
         store.event(self.conn, "bind", actor=f"tg:{uid}", account_id=aid, rc_device_id=did,
                     user_id=int(args[1]))
-        self.tg.send(chat["id"], f"✅ 已把 <code>{aid}:{did}</code> 归到 tg:<code>{args[1]}</code>"
-                                 f"（历史请求也一并改归）", thread)
+        self.tg.send(chat["id"], f"✅ 设备 <code>{did}</code> → {esc(self.user_display_name(int(args[1])))}", thread)
 
     # ---------------------------------------------------------------- 管理员：采集/账单
     def cmd_quota(self, chat, msg, uid, args, thread):
@@ -762,8 +764,7 @@ class Bot:
                     pending += amount
                 else:
                     assigned += amount
-                    person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (u,)).fetchone()
-                    name = person['handle'] if person and person['handle'] else f'tg:{u}'
+                    name = self.user_display_name(u)
                     lines.append(f"• {esc(name)} · <b>{money(amount)}</b>")
             lines.append(f"本期已归属：{money(assigned)} · 待认领：{money(pending)}")
             if p['total_weighted'] <= 0:
@@ -829,7 +830,7 @@ class Bot:
         if pending:
             lines.append("\n<b>待核对设备归属</b>（确认实际设备后使用 /bind）")
             for row in pending:
-                lines.append(f"• {esc(row['account_id'])} · tg:{row['tg_user_id']}")
+                lines.append(f"• {esc(row['account_id'])} · {esc(self.user_display_name(row['tg_user_id']))}")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_dryrun(self, chat, msg, uid, args, thread) -> None:
