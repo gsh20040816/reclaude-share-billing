@@ -30,7 +30,7 @@ def summarize(conn, login_id, org, now=None):
         row = dict(label=label, percent=pct, start=start, end=end, observed=observed,
                    requests=0, tokens=0, usd=0, raw_usd=0, estimate=None, remaining=None, unpriced=0, reasons=[])
         if start is None or observed is None or not start <= observed < end:
-            row['reasons'].append('窗口或快照时间缺失/不匹配')
+            row['reasons'].append('窗口时间缺失或不匹配')
             result.append(row);continue
         usage = conn.execute("""SELECT model, COUNT(*) n,COALESCE(SUM(cost_usd),0) usd,
             COALESCE(SUM(total_tokens),0) tokens,SUM(cost_usd IS NULL) unpriced
@@ -43,12 +43,12 @@ def summarize(conn, login_id, org, now=None):
                    usd=sum(u['usd'] * billing.multiplier_for(rates,u['model'])[0] for u in usage))
         unpriced = sum(u['unpriced'] or 0 for u in usage)
         if not 0 <= now-observed <= 15*60000 or end <= now:
-            row['reasons'].append('快照过期，需刷新')
+            row['reasons'].append('快照过期')
         if pending or not watermark or watermark[0] is None or watermark[0] < observed:
-            row['reasons'].append('流水尚未采集到快照时刻，请 /sync 后重查')
+            row['reasons'].append('流水待同步')
         row['unpriced'] = unpriced
         if pct is None or not 5 <= pct < 100:
-            row['reasons'].append('使用率不足 5%、缺失或已封顶，不能可靠反推')
+            row['reasons'].append('使用率不足 5%、缺失或已封顶')
         if row['usd'] <= 0:
             row['reasons'].append('已采集用量不足')
         if not row['reasons']:

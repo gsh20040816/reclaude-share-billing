@@ -127,6 +127,6 @@ def collect(pool, conn, preferred=None):
 def choose(pool, conn, preferred=None):
     candidates, errors = collect(pool, conn, preferred)
     if not candidates:
-        raise NoCapacity('没有满足设备名额与额度条件的账号；不会自动下线已有设备' +
+        raise NoCapacity('暂无可分配账号' +
                          ('（部分入口读取失败：' + ', '.join(errors) + '）' if errors else ''))
     return candidates[0]

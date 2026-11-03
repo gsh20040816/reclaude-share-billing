@@ -279,7 +279,7 @@ class Bot:
                       "• <code>/periods [账号]</code> 租期与成本",
                       "• <code>/renew 计费单元ID 天数 金额</code> 接续上一期，精确到分钟",
                       "• 首期自动时间：<code>/period add 计费单元ID auto auto 金额</code>",
-                      "• 手动时间：YYYY-MM-DDTHH:MM（北京时间，结束时刻不包含）",
+                      "• 手动时间：YYYY-MM-DDTHH:MM（北京时间）",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
                       "• <code>/rates</code> 倍率表 + 未配置的模型",
                       "• <code>/revoke &lt;设备ID&gt;</code> 下线设备",
@@ -308,7 +308,7 @@ class Bot:
         amount = bill["users"].get(uid, 0.0)
         lines = [f"<b>我</b> · tg:<code>{uid}</code>", "",
                  f"本月请求 {rows['n']} 条 · {usd(rows['usd'])} · {rows['tok']:,} tokens",
-                 f"本月分摊 <b>{money(amount)}</b>（provisional）", "",
+                 f"本月分摊 <b>{money(amount)}</b>（暂估）", "",
                  f"<b>设备</b>（{len(devs)}）"]
         for d in devs[:10]:
             state = {"active": "在线", "missing": "已消失", "revoked": "已下线",
@@ -361,15 +361,13 @@ class Bot:
         if not include_history:
             devs = [d for d in devs if d['state'] == 'active']
         if not devs:
-            text = ('没有符合条件的设备；可 /sync 刷新，或 /devices all 查看历史记录。' if show_all else
-                    '没有绑定到你的设备；已登录设备可能尚未认领，请联系管理员绑定，无需重新登录。')
+            text = ('暂无设备。/sync 刷新，/devices all 查看历史。' if show_all else
+                    '暂无绑定设备，请联系管理员 /bind。')
             self.tg.send(chat['id'], text, thread)
             return
         title = ('全部设备' if include_history else '活跃设备') if show_all else '我的活跃设备'
         suffix = '，含历史记录' if include_history else ''
         lines = [f'<b>{title}</b>（{len(devs)} 台{suffix}）']
-        if show_all:
-            lines.append('数据来自最近采集；/sync 刷新。active 表示登录有效，不代表正在使用。')
         for d in devs:
             last = time.strftime('%m-%d %H:%M', time.localtime((activity.latest(self.conn, d) or 0) / 1000)) if activity.latest(self.conn, d) else '无记录'
             block = [f"• <b>{esc(self.device_display_name(d))}</b>",
@@ -382,7 +380,7 @@ class Bot:
                 lines = [f'<b>{title}（续）</b>']
             lines.extend(block)
         if show_all:
-            lines.append('绑定归属：/bind 设备ID Telegram用户ID\n只修改归属，不会撤销设备。')
+            lines.append('绑定：/bind 设备ID Telegram用户ID')
         self.tg.send(chat['id'], '\n'.join(lines), thread)
 
     def cmd_bill(self, chat, msg, uid, args, thread) -> None:
@@ -421,11 +419,11 @@ class Bot:
                                  dry_run=dry, actor=f"tg:{uid}")
         except enroll.NoSlot as exc:
             self.tg.send(chat["id"], f"⛔ 暂时没有空位：{esc(exc)}\n"
-                                     "等有人下线后再发一次链接（授权链接几分钟就过期）。", thread)
+                                     "请稍后使用新链接重试。", thread)
             return
         if dry:
             self.tg.send(chat["id"],
-                         "🧪 <b>演练模式</b>（未真正批准）\n"
+                         "🧪 <b>演练模式</b>\n"
                          f"• 账号 <code>{plan['account_id']}</code>\n"
                          f"• org <code>{plan['org_id']}</code>\n"
                          f"• 设备名 {esc(plan['device_name'])}\n"
@@ -434,14 +432,14 @@ class Bot:
             return
         if plan.get("pending"):
             self.tg.send(chat["id"], f"✅ 已批准（账号 <code>{plan['account_id']}</code>），"
-                                     "回终端完成登录即可。设备归属将在 10 分钟内尝试确认；"
-                                     "若仍未登记，请联系管理员核对设备并 /bind。", thread)
+                                     "请回终端完成登录。"
+                                     "设备待绑定。", thread)
         else:
             self.tg.send(chat["id"],
                          f"✅ 已登记\n• 账号 <code>{plan['account_id']}</code>\n"
                          f"• 设备 <code>{plan['account_id']}:{plan['device_id']}</code>\n"
                          f"• 机器 {esc(plan.get('hostname'))}\n\n"
-                         "回终端继续，Claude Code 现在应该能跑起来了。", thread)
+                         "请回终端继续。", thread)
 
     def _display_name(self, chat, msg, uid) -> str:
         u = msg.get("from") or {}
@@ -475,7 +473,7 @@ class Bot:
             raise ValueError('用法：/unit_link 计费单元ID 上游账号ID')
         ledger.link_account(self.conn, args[0], int(args[1]))
         self.conn.commit()
-        self.tg.send(chat['id'], '已关联到同一席位，保留原成本和历史流水。', thread)
+        self.tg.send(chat['id'], '已关联席位。', thread)
 
     def cmd_units(self, chat, msg, uid, args, thread) -> None:
         rows = self.conn.execute("SELECT * FROM billing_units ORDER BY org_id,upstream_account_id").fetchall()
@@ -487,12 +485,11 @@ class Bot:
             lines.append("  登录入口：" + (", ".join(esc(r[0]) for r in sources) or "历史订阅"))
             sub = self.conn.execute('SELECT * FROM org_subscriptions WHERE org_id=?', (unit['org_id'],)).fetchone()
             if sub and sub['expires_at']:
-                lines.append(f"  上游到期：{store.iso(sub['expires_at'])}（自动观测）")
+                lines.append(f"  上游到期：{store.iso(sub['expires_at'])}")
                 if sub['started_at']:
-                    lines.append(f"  上游开始：{store.iso(sub['started_at'])}（已核对本组织）")
+                    lines.append(f"  上游开始：{store.iso(sub['started_at'])}")
                 else:
                     lines.append("  开始时间待核实")
-                lines.append("  到期延长不自动新增成本或修改已配置租期")
             aliases = self.conn.execute('SELECT upstream_account_id FROM upstream_assignments WHERE unit_id=?', (unit['id'],)).fetchall()
             lines.append("  历史上游账号：" + ', '.join(str(r[0]) for r in aliases))
             ps = billing.periods(self.conn, unit["id"])
@@ -506,7 +503,7 @@ class Bot:
             lines.append(f"  ⚠️ 待核对：组织 {org_id} / 上游账号 {upstream_id}，{count} 条")
         if not rows:
             lines.append("尚未发现订阅账号，请先添加登录账号并 /sync。")
-        lines.append("多席位换号或历史归属待核对：/unit_link 计费单元ID 上游账号ID")
+        lines.append("关联：/unit_link 计费单元ID 上游账号ID")
         lines.append("设置成本：/period add 计费单元ID 起 止 金额")
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
@@ -527,30 +524,30 @@ class Bot:
         self.conn.execute("UPDATE rc_accounts SET enabled=0 WHERE id=?", (aid,))
         self.conn.commit()
         store.event(self.conn, "account_del", actor=f"tg:{uid}", account_id=aid)
-        self.tg.send(chat["id"], f"已停用 <code>{esc(aid)}</code>（历史流水与账单保留）。", thread)
+        self.tg.send(chat["id"], f"已停用 <code>{esc(aid)}</code>。", thread)
 
     # ---------------------------------------------------------------- 管理员：租期
     def cmd_renew(self, chat, msg, uid, args, thread):
         if len(args) != 3:
-            self.tg.send(chat['id'], '用法：/renew 计费单元ID 天数 金额\n例：/renew 25693:seat1 30 850\n从上一期结束时刻接续（北京时间，结束时刻不包含）。', thread)
+            self.tg.send(chat['id'], '用法：/renew 计费单元ID 天数 金额\n例：/renew 25693:seat1 30 850\n从上一期结束时刻接续。', thread)
             return
         p = billing.renew_period(self.conn, args[0], int(args[1]), float(args[2]),
                                  message_key=f"{chat['id']}:{msg['message_id']}")
-        self.tg.send(chat['id'], f"✅ 续费租期 #{p['id']}：{p['start_date']} ~ {p['end_date']} {money(p['cost_cny'])}\n结束时刻不包含；同一条消息重试不会重复续费。", thread)
+        self.tg.send(chat['id'], f"✅ 续费租期 #{p['id']}：{p['start_date']} ~ {p['end_date']} {money(p['cost_cny'])}", thread)
 
     def cmd_period(self, chat, msg, uid, args, thread) -> None:
         if args and args[0] == 'extend':
             if len(args) != 3:
-                raise ValueError('用法：/period extend 租期ID YYYY-MM-DDTHH:MM（补偿延期，不增加成本）')
+                raise ValueError('用法：/period extend 租期ID YYYY-MM-DDTHH:MM')
             billing.extend_period(self.conn, int(args[1]), billing.parse_boundary(args[2]))
-            self.tg.send(chat['id'], '✅ 已延长原周期，原成本不变；下次续费从延长后的结束时刻接续。', thread)
+            self.tg.send(chat['id'], '✅ 已延长租期。', thread)
             return
         if args and args[0] == "assign":
             if len(args) != 3:
                 self.tg.send(chat["id"], "用法：/period assign 旧租期ID 计费单元ID", thread)
                 return
             billing.assign_legacy_period(self.conn, int(args[1]), args[2])
-            self.tg.send(chat["id"], "✅ 旧成本已指定到计费账号（未复制费用）。", thread)
+            self.tg.send(chat["id"], "✅ 已关联成本。", thread)
             return
         if not args or args[0] != "add":
             self.tg.send(chat["id"],
@@ -704,20 +701,18 @@ class Bot:
                         lines.append(f"快照：{store.iso(w['observed'])}")
                     lines.append(f"窗口已采集：{w['requests']} 请求 · {w['tokens']:,} tokens · 加权 {usd(w['usd'])}（原始 {usd(w['raw_usd'])}）")
                     if w.get('backfill_failed'):
-                        lines.append('⚠️ 本次自动补价失败，使用已采集金额估算。')
+                        lines.append('补价失败')
                     if w['unpriced']:
-                        lines.append(f"⚠️ {w['unpriced']} 条请求尚未定价，暂未计入金额；容量估算可能偏低。")
+                        lines.append(f"未定价：{w['unpriced']} 条")
                     if w['estimate'] is not None:
-                        lines.append(f"估算总容量 ≈ {usd(w['estimate'])}，剩余 ≈ {usd(w['remaining'])}（自定义倍率加权等值）")
+                        lines.append(f"加权容量 ≈ {usd(w['estimate'])} · 剩余 ≈ {usd(w['remaining'])}")
                     else:
-                        lines.append('暂不估算：' + '；'.join(w['reasons']))
+                        lines.append('容量未知：' + '；'.join(w['reasons']))
                 snapshot = (org.get('current_account') or {}).get('usage_snapshot') or {}
                 for limit in snapshot.get('limits') or []:
                     if limit.get('kind') == 'weekly_scoped':
                         model = ((limit.get('scope') or {}).get('model') or {}).get('display_name') or '细分模型'
-                        lines.append(f"细分额度 {esc(model)}：{esc(limit.get('percent'))}%（不反推容量）")
-                lines.append('窗口起点按重置时间减 5 小时/7 天推算；用量截止快照时刻。')
-                lines.append('估算=Σ(模型用量×自定义倍率)÷使用率，模型组合变化会影响估算；未必覆盖其他客户端用量，不是官方美元额度或账单成本。')
+                        lines.append(f"细分额度 {esc(model)}：{esc(limit.get('percent'))}%")
                 self.tg.send(chat['id'], '\n'.join(lines), thread)
             except Exception as exc:
                 self.tg.send(chat['id'], f"{esc(account['id'])} 查询失败：{esc(str(exc)[:200])}", thread)
@@ -757,7 +752,7 @@ class Bot:
             grouped.setdefault(line['period_id'], []).append(line)
         for pid, entries in grouped.items():
             p = entries[0]
-            status = '暂估（周期未结束）' if p['status'] == 'provisional' else '周期已结束'
+            status = '进行中' if p['status'] == 'provisional' else '周期已结束'
             lines = [f"<b>订阅周期账单 #{pid}</b> · {status}",
                      f"计费席位：<code>{esc(p['billing_unit_id'])}</code>",
                      f"{esc(p['start'])} ~ {esc(p['end'])}",
@@ -767,8 +762,6 @@ class Bot:
                 u, amount = entry['user_id'], entry['amount_cny']
                 if u is None:
                     pending += amount
-                    if entry['note']:
-                        lines.append(f"⚠️ {esc(entry['note'])}")
                 else:
                     assigned += amount
                     person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (u,)).fetchone()
@@ -776,17 +769,16 @@ class Bot:
                     lines.append(f"• {esc(name)} · <b>{money(amount)}</b>")
             lines.append(f"本期已归属：{money(assigned)} · 待认领：{money(pending)}")
             if p['total_weighted'] <= 0:
-                lines.append('本期无可分摊用量，成本尚未分配。')
+                lines.append('本期暂无用量。')
             self.tg.send(chat['id'], '\n'.join(lines), thread)
-        lines = [f"<b>账单数据检查</b> · 筛选 {start} ~ {end}",
-                 '日期仅筛选相交订阅周期，各周期独立按整期用量计算。']
+        lines = [f"<b>账单数据</b> · {start} ~ {end}"]
         if not grouped:
             lines.append('没有匹配的订阅周期。')
         an = bill["anomalies"]
         if an.get("legacy_periods"):
-            lines.append("⚠️ 旧成本尚未指定到订阅账号，请 /periods 查看并 /period assign。")
+            lines.append("成本待关联：/periods 查看，/period assign 关联。")
         if an.get("unresolved_requests"):
-            lines.append(f"⚠️ {an['unresolved_requests']} 条流水的上游账号归属待回补，暂未计费。")
+            lines.append(f"归属待补：{an['unresolved_requests']} 条")
         if an["incomplete"]:
             lines.append("\n<b>缺租期</b>")
             for x in an["incomplete"]:
