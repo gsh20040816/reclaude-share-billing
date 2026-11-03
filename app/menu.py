@@ -4,6 +4,7 @@ import json
 from . import store
 
 USER_COMMANDS = [
+    ("id", "查看用户 ID、聊天 ID 和话题 ID"),
     ("me", "我的概览 · 设备与本月账单"),
     ("devices", "查看我的设备"),
     ("bill", "查看我的账单"),

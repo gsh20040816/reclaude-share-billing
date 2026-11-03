@@ -136,7 +136,7 @@ class Bot:
         command = parts[0].split('@')[0].lower() if parts else ''
         if command == '/sync':
             return 'sync'
-        if command in {'/start', '/help', '/me', '/devices', '/bill', '/units',
+        if command in {'/id', '/start', '/help', '/me', '/devices', '/bill', '/units',
                        '/accounts', '/periods', '/rates', '/health'}:
             return 'read'
         if command == '/report' and not {'save', 'refresh'} & {p.lower() for p in parts[1:]}:
@@ -222,7 +222,7 @@ class Bot:
         cmd = parts[0].split("@")[0].lower()
         args = parts[1:]
         handler = {
-            "/start": self.cmd_help, "/help": self.cmd_help,
+            "/id": self.cmd_id, "/start": self.cmd_help, "/help": self.cmd_help,
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
             "/login": self.cmd_login,
@@ -249,6 +249,14 @@ class Bot:
         self.flows.pop(uid, None)
         self.tg.send(chat["id"], "已取消当前操作。", thread)
 
+    def cmd_id(self, chat, msg, uid, args, thread) -> None:
+        lines = [f"用户 ID：<code>{uid}</code>",
+                 f"聊天 ID：<code>{chat['id']}</code>",
+                 f"聊天类型：{esc(chat.get('type', 'unknown'))}"]
+        if thread is not None:
+            lines.append(f"话题 ID：<code>{thread}</code>")
+        self.tg.send(chat['id'], '\n'.join(lines), thread)
+
     def cmd_help(self, chat, msg, uid, args, thread) -> None:
         lines = ["<b>ReClaude 合租</b>", "",
                  "<b>用户</b>",
@@ -256,6 +264,7 @@ class Bot:
                  "• <code>/me</code> 我的设备与本月账单",
                  "• <code>/devices</code> 我的设备列表",
                  "• <code>/bill [起] [止]</code> 我的账单明细",
+                 "• <code>/id</code> 查看用户、聊天和话题 ID",
                  "• <code>/help</code> 本帮助",
                  "• <code>/cancel</code> 取消当前操作"]
         if self.is_admin(uid):
