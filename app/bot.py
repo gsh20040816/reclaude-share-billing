@@ -4,12 +4,14 @@ from __future__ import annotations
 import html
 import json
 import re
+import signal
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 
 from . import billing, enroll, evictor, store, syncer, ledger
 from .runtime import Runtime
@@ -74,6 +76,13 @@ class Bot:
         self.flows: dict[int, dict] = {}
         self._fail_counts: dict[str, int] = {}
         self._stop = threading.Event()
+        self._workers = {
+            'read': ThreadPoolExecutor(max_workers=4, thread_name_prefix='bot-read'),
+            'sync': ThreadPoolExecutor(max_workers=1, thread_name_prefix='bot-sync'),
+            'write': ThreadPoolExecutor(max_workers=1, thread_name_prefix='bot-write'),
+        }
+        self._pending = threading.BoundedSemaphore(64)
+
 
     # ---------------------------------------------------------------- 权限
     def is_admin(self, uid: int) -> bool:
@@ -104,14 +113,48 @@ class Bot:
                 continue
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
-                try:
-                    self.handle(upd)
-                except Exception as exc:          # noqa: BLE001
-                    self.conn.rollback()
-                    self.reply_error(upd, exc)
+                self.dispatch(upd)
+
+    @staticmethod
+    def command_lane(upd):
+        parts = ((upd.get('message') or {}).get('text') or '').split()
+        command = parts[0].split('@')[0].lower() if parts else ''
+        if command == '/sync':
+            return 'sync'
+        if command in {'/start', '/help', '/me', '/devices', '/bill', '/units',
+                       '/accounts', '/periods', '/rates', '/health'}:
+            return 'read'
+        if command == '/report' and not {'save', 'refresh'} & {p.lower() for p in parts[1:]}:
+            return 'read'
+        return 'write'
+
+    def dispatch(self, upd):
+        # Bounded backpressure rather than unbounded queued commands.
+        while not self._stop.is_set():
+            if self._pending.acquire(timeout=.2):
+                break
+        else:
+            return None
+        try:
+            return self._workers[self.command_lane(upd)].submit(self._run_update, upd)
+        except BaseException:
+            self._pending.release()
+            raise
+
+    def _run_update(self, upd):
+        try:
+            self.handle(upd)
+        except Exception as exc:
+            self.conn.rollback()
+            self.reply_error(upd, exc)
+        finally:
+            self.conn.close()  # transaction/connection belongs to this worker only
+            self._pending.release()
 
     def stop(self) -> None:
         self._stop.set()
+        for worker in self._workers.values():
+            worker.shutdown(wait=True)
 
     def reply_error(self, upd: dict, exc: Exception) -> None:
         msg = upd.get("message") or {}
@@ -137,10 +180,16 @@ class Bot:
         row = self.conn.execute("SELECT tg_user_id FROM users WHERE tg_user_id=?", (uid,)).fetchone()
         if row is None:
             self.conn.execute(
-                "INSERT INTO users(tg_user_id, handle, role, status, created_at) VALUES (?,?,?, 'active', ?)",
+                "INSERT OR IGNORE INTO users(tg_user_id, handle, role, status, created_at) VALUES (?,?,?, 'active', ?)",
                 (uid, ("@" + user["username"]) if user.get("username") else (user.get("first_name") or str(uid)),
                  "admin" if uid in self.admins else "user", store.iso()))
             self.conn.commit()
+
+        # Read-only and sync commands do not mutate multi-step conversation state.
+        # All flow steps and state-changing commands share one ordered writer.
+        if self.command_lane(upd) != 'write':
+            self.command(chat, msg, uid, text, thread)
+            return
 
         # 多步流程优先
         if uid in self.flows and not text.startswith("/"):
@@ -798,7 +847,14 @@ def main() -> None:
                          '（{"bot_token": "...", "admin_ids": [123], "allowed_chat_ids": [123]}）')
     bot = Bot(rt)
     print("bot started")
-    bot.run()
+    # Stop polling first, then drain accepted commands during service shutdown.
+    signal.signal(signal.SIGTERM, lambda *_: bot._stop.set())
+    signal.signal(signal.SIGINT, lambda *_: bot._stop.set())
+    try:
+        bot.run()
+    finally:
+        bot.stop()
+        rt.close()
 
 
 if __name__ == "__main__":
