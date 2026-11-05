@@ -326,7 +326,7 @@ class Bot:
         self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def device_display_name(self, device):
-        name = device['name'] or ''
+        name = re.sub(r' \[rcb-[0-9a-f]+\]$', '', device['name'] or '')
         if name.startswith('rcb-'):
             login = self.conn.execute(
                 "SELECT hostname,os,arch FROM login_states WHERE account_id=? "

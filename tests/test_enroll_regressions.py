@@ -106,7 +106,7 @@ def test_pick_account_preferred_is_strict(make_rt):
 def test_approve_binds_named_device_not_unrelated(make_rt):
     rt, state = make_rt()
     state.devices_next = [_device_dict(100, "old-device"),
-                          _device_dict(777, "u999@999")]
+                          _device_dict(777, "__approved__")]
 
     plan = enroll.enroll(rt.pool, rt.conn, state="STATE-APPROVE", tg_user_id=999,
                          device_name="u999@999", dry_run=False, max_wait=0.1)
@@ -135,7 +135,11 @@ def test_pending_login_claimed_by_sync(make_rt):
         "SELECT * FROM login_states WHERE state='STATE-PENDING'").fetchone()
     assert ls["status"] == "approved_pending_device"
     note = json.loads(ls["note"])
-    assert note["device_name"].endswith(device_name)
+    assert note["device_name"].startswith('reclaude on test-laptop · linux-amd64')
+    assert device_name not in note["device_name"]
+    assert note['marker'] in note['device_name']
+    approve = next(body for path,body in state.posts if path.endswith('/approve'))
+    assert approve['device_name'] == note['device_name']
     assert isinstance(note["approved_at_ms"], int)
 
     # 远早于本次 sync 窗口的历史流水：只有 claim 的 UPDATE 才能补上归属

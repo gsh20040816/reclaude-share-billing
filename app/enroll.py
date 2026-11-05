@@ -78,6 +78,9 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
     acc = store.account_row(conn, selected['account_id'])
     org_id = selected['org_id']
     info = describe(pool, conn, state, acc['id'])
+    hostname = str(info.get('hostname') or 'unknown-device').strip()
+    platform = '-'.join(str(info[k]).strip() for k in ('os', 'arch') if info.get(k))
+    device_name = f'reclaude on {hostname}' + (f' · {platform}' if platform else '')
     plan = {
         "account_id": acc['id'], "org_id": org_id, "device_name": device_name,
         "hostname": info.get('hostname'), "os": info.get('os'), "arch": info.get('arch'),
@@ -91,8 +94,8 @@ def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
         return plan
 
     marker = "rcb-" + secrets.token_hex(12)
-    # Keep the authorization marker intact even if a display name is unusually long.
-    assigned_name = f"{marker} {device_name[:32]}"
+    # Keep the requesting machine visible and retain the unique claim marker.
+    assigned_name = f"{device_name[:160]} [{marker}]"
     with pool.session(acc["id"]) as session:
         live = session.devices()
         syncer._upsert_devices(conn, acc["id"], live)

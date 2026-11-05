@@ -61,7 +61,7 @@ def test_pending_claim_does_not_guess_when_name_rewritten(rt):
     assert plan["pending"] is True
     note = json.loads(runtime.conn.execute(
         "SELECT note FROM login_states WHERE state='STATE-LATE'").fetchone()["note"])
-    assert note["device_name"].endswith("u999@999")
+    assert note["device_name"].startswith("reclaude on test-laptop")
 
     runtime.conn.execute(
         "INSERT INTO requests(billing_unit_id,id, account_id, rc_device_id, created_at, first_seen_at)"

@@ -16,7 +16,7 @@ def test_pending_alice_does_not_claim_bobs_login(env):
     rt, state = env
     enroll.enroll(rt.pool, rt.conn, state='alice', tg_user_id=111,
                   device_name='alice', dry_run=False, max_wait=0)
-    state.devices_next = [{'id': 777, 'name': 'bob'}]
+    state.devices_next = [{'id': 777, 'name': '__approved__'}]
     with patch('app.enroll.time.sleep', return_value=None):
         enroll.enroll(rt.pool, rt.conn, state='bob', tg_user_id=222,
                       device_name='bob', dry_run=False, max_wait=0.001)

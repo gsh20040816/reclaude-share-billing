@@ -64,11 +64,9 @@ class FakeClient:
         if path == "/api/cli/auth/approve":
             if self.state.devices_next is not None:
                 self.state.devices = [dict(d) for d in self.state.devices_next]
-                # Simulate the upstream preserving the requested name on this login's device.
-                original = body["device_name"].split(" ", 1)[-1]
                 for device in self.state.devices:
-                    if device.get("name") == original:
-                        device["name"] = body["device_name"]
+                    if device.get('name') == '__approved__':
+                        device['name'] = body['device_name']
             return {"ok": True}
         if path.endswith("/revoke"):
             return {"ok": True}
@@ -194,7 +192,7 @@ def test_enroll_dry_run_does_not_approve(env):
 
 def test_enroll_approve_registers_device(env):
     rt, state = env
-    state.devices_next = [{"id": 777, "name": "u999@999", "org_id": 1, "sk_prefix": "sk-rec-x",
+    state.devices_next = [{"id": 777, "name": "__approved__", "org_id": 1, "sk_prefix": "sk-rec-x",
                            "last_used_at": store.now_ms(), "created_at": store.now_ms(),
                            "machine_summary": {}, "client_platform": "linux"}]
     enroll.enroll(rt.pool, rt.conn, state="STATE654321", tg_user_id=999,
