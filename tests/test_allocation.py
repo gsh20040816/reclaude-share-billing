@@ -22,9 +22,9 @@ def test_recent_usage_and_plan_capacity_influence_equal_quota():
 def test_stale_is_not_zero_and_full_is_excluded():
     assert allocation.rank([candidate(1,None),candidate(2,.8),candidate(3,0,available=False)])[0]['org_id']==2
     now=store.now_ms()
-    a={'usage_updated_at':now,'usage_snapshot':{'five_hour':{'utilization':8},'seven_day':{'utilization':96},'limits':[{'percent':100}]}}
-    assert allocation.pressure(a,now)==1
-    assert allocation.pressure(a,now+16*60_000) is None
+    a={'usage_updated_at':now,'usage_snapshot':{'five_hour':{'utilization':8},'seven_day':{'utilization':96},'limits':[{'kind':'weekly_scoped','percent':100}]}}
+    assert allocation.pressure(a,now)==.96
+    assert allocation.pressure(a,now+31*60_000) is None
     a['usage_snapshot']['five_hour']['resets_at']='2020-01-01T00:00:00Z'
     assert allocation.pressure(a,now) is None
 
@@ -65,3 +65,29 @@ def test_full_own_org_does_not_fall_back_to_joined_org(env):
     rt,state=env
     state.quota['account_used']=state.quota['account_max']
     assert allocation.collect(rt.pool,rt.conn)[0] == []
+
+
+@pytest.mark.parametrize('overall', [79,100])
+def test_explicit_account_ignores_quota_but_not_device_capacity(env, overall):
+    rt,state=env
+    original=FakeClient.get
+    def get(client,path):
+        result=original(client,path)
+        if path=='/api/app/orgs/':
+            account=result['items'][0]['current_account']
+            account.update(usage_updated_at=store.now_ms(),usage_snapshot={
+                'five_hour':{'utilization':3},'seven_day':{'utilization':overall},
+                'limits':[{'kind':'weekly_scoped','percent':100}]})
+        return result
+    with patch.object(FakeClient,'get',get):
+        selected=allocation.choose(rt.pool,rt.conn,preferred='a1')
+        assert selected['account_id']=='a1'
+        assert selected['pressure']==overall/100
+        if overall==79:
+            assert allocation.choose(rt.pool,rt.conn)['account_id']=='a1'
+        else:
+            with pytest.raises(allocation.NoCapacity):allocation.choose(rt.pool,rt.conn)
+        state.quota['used']=state.quota['max']
+        with pytest.raises(allocation.NoCapacity):allocation.choose(rt.pool,rt.conn,preferred='a1')
+        with pytest.raises(allocation.NoCapacity):allocation.choose(rt.pool,rt.conn,preferred='missing')
+    assert not any(p.endswith('/approve') or p.endswith('/revoke') for p,b in state.posts)

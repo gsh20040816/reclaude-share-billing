@@ -2,7 +2,7 @@
 import math
 from datetime import datetime
 from . import store
-from .quota_refresh import refresh_usage
+from .quota_refresh import refresh_usage, timestamp, INTERVAL_MS
 
 
 class NoCapacity(Exception):
@@ -21,11 +21,12 @@ def number(value):
 
 def pressure(account, now):
     snapshot = account.get('usage_snapshot') or {}
-    updated = number(account.get('usage_updated_at'))
-    if updated is None or not 0 <= now - updated <= 15 * 60_000:
+    updated = timestamp(account.get('usage_updated_at'))
+    if updated is None or not 0 <= now - updated <= INTERVAL_MS:
         return None
     windows = [snapshot.get('five_hour'), snapshot.get('seven_day')]
-    windows += snapshot.get('limits') or []
+    windows += [w for w in snapshot.get('limits') or []
+                if w.get('kind') in ('session', 'weekly_all')]
     values = []
     for window in windows:
         if not isinstance(window, dict):
@@ -45,13 +46,13 @@ def pressure(account, now):
     return max(values) if values else None
 
 
-def rank(candidates):
+def rank(candidates, *, allow_exhausted=False):
     """Minimize limiting-window pressure, with recent normalized spend as load signal.
 
     Unknown/stale usage is fallback only. A 20x plan's spend is divided by 20,
     a 5x plan's by 5; this is a relative load heuristic, not a dollar allowance.
     """
-    valid = [c for c in candidates if c['available'] and (c['pressure'] is None or c['pressure'] < 1)]
+    valid = [c for c in candidates if c['available'] and (allow_exhausted or c['pressure'] is None or c['pressure'] < 1)]
     largest = max((c['normalized_usage'] for c in valid), default=0)
     return sorted(valid, key=lambda c: (
         c['pressure'] is None,
@@ -113,7 +114,7 @@ def collect(pool, conn, preferred=None):
     # Same upstream/org through several login credentials is a single candidate.
     result = []
     seen = set()
-    for candidate in rank(candidates):
+    for candidate in rank(candidates, allow_exhausted=preferred is not None):
         key = candidate['org_id'], candidate['upstream_account_id']
         if key not in seen:
             result.append(candidate)
