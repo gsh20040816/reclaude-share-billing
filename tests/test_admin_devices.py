@@ -62,7 +62,7 @@ def test_short_id_resolution_prefers_active_own_entry_and_rejects_ambiguity(bot)
         bot._resolve_device('100')
 
 
-def test_revoke_ownership_and_bind_cannot_steal(bot, monkeypatch):
+def test_revoke_ownership_and_free_bind(bot, monkeypatch):
     from app import evictor
     add(bot,'a1',100,1,ADMIN)
     add(bot,'a1',101,1,555)
@@ -73,9 +73,9 @@ def test_revoke_ownership_and_bind_cannot_steal(bot, monkeypatch):
     bot.command(msg['chat'],msg,555,'/revoke 100',None)
     assert not calls and '只能下线自己的' in bot.tg.sent[-1]
     bot.command(msg['chat'],msg,555,'/bind 100 555',None)
-    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=100').fetchone()[0]==ADMIN
-    bot.command(msg['chat'],msg,555,'/bind 102 555',None)
-    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=102').fetchone()[0]==555
+    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=100').fetchone()[0]==555
+    bot.command(msg['chat'],msg,555,'/bind 102 777',None)
+    assert bot.conn.execute('SELECT user_id FROM devices WHERE rc_device_id=102').fetchone()[0]==777
     bot.command(msg['chat'],msg,555,'/revoke 101',None)
     assert len(calls)==1 and calls[-1][1]['reason']=='manual'
     bot.command(_msg()['chat'],_msg(),ADMIN,'/revoke 101',None)

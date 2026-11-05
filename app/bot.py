@@ -681,13 +681,6 @@ class Bot:
             return
         try:
             aid, did = self._resolve_device(args[0])
-            if not self.is_admin(uid):
-                device = self.conn.execute('SELECT org_id,user_id FROM devices WHERE account_id=? AND rc_device_id=?', (aid, did)).fetchone()
-                owners = self.conn.execute('SELECT user_id FROM devices WHERE org_id IS ? AND rc_device_id=? AND user_id IS NOT NULL',
-                                           (device['org_id'], did)).fetchall() if device else []
-                if device is None or int(args[1]) != uid or any(r['user_id'] != uid for r in owners):
-                    self.tg.send(chat['id'], '只能认领未绑定设备；改绑请联系管理员。', thread)
-                    return
             enroll.bind_device(self.conn, aid, did, int(args[1]))
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
