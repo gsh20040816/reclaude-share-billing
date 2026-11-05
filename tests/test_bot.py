@@ -92,3 +92,24 @@ def test_login_dry_run_flow(bot):
     chat = _msg()["chat"]
     bot.command(chat, _msg(), ADMIN, "/login https://www.reclaude.ai/cli/auth?state=ABCDEFGH123", None)
     assert any("演练" in s or "登记" in s for s in bot.tg.sent)
+
+
+@pytest.mark.parametrize('suffix,preferred', [('', None), (' a1','a1')])
+def test_login_optional_account(bot, monkeypatch, suffix, preferred):
+    from app import enroll
+    calls=[]
+    def fake(*args,**kwargs):
+        calls.append(kwargs)
+        raise enroll.NoSlot('test')
+    monkeypatch.setattr(enroll,'enroll',fake)
+    bot.command(_msg()['chat'],_msg(),ADMIN,'/login https://www.reclaude.ai/cli/auth?state=ABCDEFGH123'+suffix,None)
+    assert calls[0]['preferred_account']==preferred
+    assert calls[0]['state']=='ABCDEFGH123'
+
+
+def test_login_invalid_account_or_extra_args_never_approves(bot, monkeypatch):
+    from app import enroll
+    monkeypatch.setattr(enroll,'enroll',lambda *a,**kw: pytest.fail('must not approve'))
+    for text in ('/login ABCDEFGH123 missing', '/login ABCDEFGH123 a1 extra'):
+        bot.command(_msg()['chat'],_msg(),ADMIN,text,None)
+        assert '账号不存在' in bot.tg.sent[-1] or '用法' in bot.tg.sent[-1]

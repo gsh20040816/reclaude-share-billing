@@ -261,7 +261,7 @@ class Bot:
     def cmd_help(self, chat, msg, uid, args, thread) -> None:
         lines = ["<b>ReClaude 合租</b>", "",
                  "<b>用户</b>",
-                 "• <code>/login &lt;授权链接&gt;</code> 登记本机（reclaude login 打印的链接）",
+                 "• <code>/login &lt;授权链接&gt; [账号]</code> 登记本机（reclaude login 打印的链接）",
                  "• <code>/me</code> 我的设备与本月账单",
 
                  "• <code>/bill [起] [止]</code> 我的账单明细",
@@ -403,12 +403,17 @@ class Bot:
             self.tg.send(chat["id"], "\n".join(lines), thread)
 
     def cmd_login(self, chat, msg, uid, args, thread) -> None:
-        if not args:
+        if not 1 <= len(args) <= 2:
             self.tg.send(chat["id"],
                          "用法：在本机跑 <code>reclaude login</code>，把终端打印的授权链接发给我：\n"
-                         "<code>/login https://www.reclaude.ai/cli/auth?state=...</code>", thread)
+                         "<code>/login https://www.reclaude.ai/cli/auth?state=... [账号]</code>\n"
+                         "账号列表：/accounts", thread)
             return
-        raw = " ".join(args)
+        preferred = args[1] if len(args) == 2 else None
+        if preferred and not any(a['id'] == preferred for a in store.enabled_accounts(self.conn)):
+            self.tg.send(chat['id'], f'账号不存在或已停用：{esc(preferred)}。/accounts 查看账号。', thread)
+            return
+        raw = args[0]
         m = re.search(r"state=([A-Za-z0-9_\-]+)", raw)
         state = m.group(1) if m else raw.strip()
         if not state or len(state) < 8:
@@ -419,7 +424,7 @@ class Bot:
         try:
             plan = enroll.enroll(self.pool, self.conn, state=state, tg_user_id=uid,
                                  device_name=self._display_name(chat, msg, uid),
-                                 dry_run=dry, actor=f"tg:{uid}")
+                                 dry_run=dry, preferred_account=preferred, actor=f"tg:{uid}")
         except enroll.NoSlot as exc:
             self.tg.send(chat["id"], f"⛔ 暂时没有空位：{esc(exc)}\n"
                                      "请稍后使用新链接重试。", thread)
