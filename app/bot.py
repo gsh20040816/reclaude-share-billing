@@ -281,7 +281,7 @@ class Bot:
                       "• <code>/account_del &lt;账号&gt;</code> 停用账号",
                       "• <code>/period add &lt;计费单元ID&gt; &lt;起&gt; &lt;止&gt; &lt;¥&gt; [none|even]</code>",
                       "• <code>/periods [账号]</code> 租期与成本",
-                      "• <code>/renew 计费单元ID 天数 金额</code> 接续上一期，精确到分钟",
+                      "• <code>/renew 计费单元ID auto|天数 金额</code> 接续上一期",
                       "• 首期自动时间：<code>/period add 计费单元ID auto auto 金额</code>",
                       "• 手动时间：YYYY-MM-DDTHH:MM（北京时间）",
                       "• <code>/rate &lt;模型|通配&gt; &lt;倍率&gt;</code> 设置隐藏倍率",
@@ -537,10 +537,18 @@ class Bot:
     # ---------------------------------------------------------------- 管理员：租期
     def cmd_renew(self, chat, msg, uid, args, thread):
         if len(args) != 3:
-            self.tg.send(chat['id'], '用法：/renew 计费单元ID 天数 金额\n例：/renew 25693:seat1 30 850\n从上一期结束时刻接续。', thread)
+            self.tg.send(chat['id'], '用法：/renew 计费单元ID auto|天数 金额\n例：/renew 25693:seat1 auto 850\n从上一期结束时刻接续。', thread)
             return
-        p = billing.renew_period(self.conn, args[0], int(args[1]), float(args[2]),
-                                 message_key=f"{chat['id']}:{msg['message_id']}")
+        key = f"{chat['id']}:{msg['message_id']}"
+        receipt = self.conn.execute('SELECT period_id FROM renewal_receipts WHERE message_key=?', (key,)).fetchone()
+        if receipt:
+            p = self.conn.execute('SELECT * FROM account_periods WHERE id=?', (receipt[0],)).fetchone()
+        else:
+            amount = float(args[2])
+            auto = args[1].lower() == 'auto'
+            end_ms = ledger.renewal_expiry(self.pool, self.conn, args[0]) if auto else None
+            p = billing.renew_period(self.conn, args[0], None if auto else int(args[1]), amount,
+                                     message_key=key, end_ms=end_ms)
         self.tg.send(chat['id'], f"✅ 续费租期 #{p['id']}：{p['start_date']} ~ {p['end_date']} {money(p['cost_cny'])}", thread)
 
     def cmd_period(self, chat, msg, uid, args, thread) -> None:

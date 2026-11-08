@@ -115,3 +115,26 @@ def observe_own_start(conn, own_org_id, orgs, me):
     conn.execute('UPDATE org_subscriptions SET started_at=?,start_source=? WHERE org_id=?',
                  (start if valid else None, 'owner subscription API' if valid else None, own_org_id))
     conn.commit()
+
+
+def renewal_expiry(pool, conn, unit_id):
+    unit = conn.execute('SELECT org_id FROM billing_units WHERE id=?', (unit_id,)).fetchone()
+    if unit is None:
+        raise ValueError('计费单元不存在')
+    for account in store.enabled_accounts(conn):
+        if account['own_org_id'] != unit['org_id']:
+            continue
+        with pool.session(account['id']) as session:
+            own = session.device_quota().get('account_org_id')
+            if own != unit['org_id']:
+                continue
+            org = next((o for o in session.get('/api/app/orgs/').get('items', []) if o['id'] == own), None)
+        if not org:
+            continue
+        end = org.get('subscription_expires_at')
+        if not isinstance(end, int) or isinstance(end, bool) or end <= 0:
+            raise ValueError('上游未返回有效到期时间')
+        observe(conn, org)
+        conn.commit()
+        return end
+    raise ValueError('未找到该组织的启用登录账号')

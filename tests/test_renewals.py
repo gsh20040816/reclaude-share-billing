@@ -101,3 +101,28 @@ def test_compensation_extension_moves_next_renewal_without_new_cost(env):
     assert billing.periods(c, '1:seat1')[0]['cost_cny'] == 850
     with pytest.raises(ValueError, match='重叠'):
         billing.extend_period(c, pid, billing.parse_boundary('2026-11-13T19:33'))
+
+
+def test_auto_renew_uses_live_expiry_and_is_idempotent(bot, monkeypatch):
+    from test_core import FakeClient
+    ledger.ensure_unit(bot.conn, 1, 101)
+    billing.add_period(bot.conn, '1:seat1', billing.parse_boundary('2026-10-13T19:33'),
+                       billing.parse_boundary('2026-11-12T19:33'), 850)
+    end=billing.boundary_ms(billing.parse_boundary('2026-12-12T20:45'))
+    original=FakeClient.get
+    def get(client,path):
+        if path=='/api/app/orgs/':
+            return {'items':[{'id':1,'subscription_expires_at':end,'seat_count':1,
+                              'current_account':{'id':999}}]}
+        return original(client,path)
+    monkeypatch.setattr(FakeClient,'get',get)
+    msg=_msg();bot.command(msg['chat'],msg,ADMIN,'/renew 1:seat1 auto 900',None)
+    ps=billing.periods(bot.conn,'1:seat1');assert len(ps)==2
+    p=max(ps,key=lambda p:p['id'])
+    assert p['start_date']=='2026-11-12T19:33:00+08:00'
+    assert p['end_date']=='2026-12-12T20:45:00+08:00' and p['cost_cny']==900
+    bot.command(msg['chat'],msg,ADMIN,'/renew 1:seat1 auto 900',None)
+    assert len(billing.periods(bot.conn,'1:seat1'))==2
+    with pytest.raises(ValueError,match='无新增续期'):
+        billing.renew_period(bot.conn,'1:seat1',None,900,message_key='new',end_ms=end)
+    assert len(billing.periods(bot.conn,'1:seat1'))==2

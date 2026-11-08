@@ -173,8 +173,8 @@ def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
     return cur.lastrowid
 
 
-def renew_period(conn, unit_id, days, cost_cny, *, message_key):
-    if not isinstance(days, int) or not 1 <= days <= 3660:
+def renew_period(conn, unit_id, days, cost_cny, *, message_key, end_ms=None):
+    if end_ms is None and (not isinstance(days, int) or not 1 <= days <= 3660):
         raise ValueError('续费天数必须是 1~3660 的整数')
     try:
         conn.execute("UPDATE settings SET value=value WHERE key='subscription_ledger_v1'")
@@ -189,7 +189,12 @@ def renew_period(conn, unit_id, days, cost_cny, *, message_key):
         latest = max(previous, key=lambda p: period_bounds(p)[1])
         start_ms = period_bounds(latest)[1]
         start = datetime.fromtimestamp(start_ms / 1000, BILLING_TZ)
-        end = start + timedelta(days=days)
+        if end_ms is not None:
+            if not isinstance(end_ms, int) or isinstance(end_ms, bool) or end_ms <= start_ms:
+                raise ValueError('上游到期时间未超过已配置周期，无新增续期')
+            end = datetime.fromtimestamp(end_ms / 1000, BILLING_TZ)
+        else:
+            end = start + timedelta(days=days)
         pid = add_period(conn, unit_id, start, end, cost_cny,
                          idle_split=latest['idle_split'], note='管理员确认续费', _commit=False)
         conn.execute('INSERT INTO renewal_receipts VALUES (?,?)', (message_key, pid))
