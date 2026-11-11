@@ -272,13 +272,13 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
 
 
 def backfill_prices(pool, conn, account_id: str, hours: int | None = None) -> dict:
-    """把 pending 的请求重新拉一遍补价格（同一批 id 的状态更新，不是重复计费）。"""
+    """重新查询 pending / failed 请求补价格（同一批 id 更新，不是重复计费）。"""
     hours = hours or store.get_int(conn, "price_backfill_hours", 24)
     since = store.now_ms() - hours * 3_600_000
     rows = conn.execute(
         """SELECT id, created_at FROM requests
            WHERE account_id=? AND created_at>=?
-             AND (pricing_status='pending' OR pricing_status IS NULL)
+             AND (pricing_status IN ('pending', 'failed') OR pricing_status IS NULL)
            ORDER BY created_at LIMIT 2000""", (account_id, since)).fetchall()
     if not rows:
         return {"pending": 0, "priced": 0}

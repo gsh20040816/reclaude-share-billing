@@ -119,12 +119,13 @@ def test_sync_idempotent_and_attribution(env):
     assert wm["last_synced_at"] > 0
 
 
-def test_price_backfill(env):
+@pytest.mark.parametrize("initial_status", ["pending", "failed", None])
+def test_price_backfill(env, initial_status):
     rt, state = env
     rt.conn.execute("INSERT INTO devices(account_id, rc_device_id, user_id, name, state, first_seen_at)"
                     " VALUES ('a1', 200, 222, 'u2', 'active', ?)", (store.iso(),))
     rt.conn.commit()
-    state.add_item(2001, 200, 0, status="pending")
+    state.add_item(2001, 200, 0, status=initial_status)
     syncer.sync_account(rt.pool, rt.conn, "a1")
     assert rt.conn.execute("SELECT cost_usd FROM requests WHERE id=2001").fetchone()[0] is None
 
@@ -133,6 +134,31 @@ def test_price_backfill(env):
     out = syncer.backfill_prices(rt.pool, rt.conn, "a1")
     assert out["priced"] >= 1
     assert abs(rt.conn.execute("SELECT cost_usd FROM requests WHERE id=2001").fetchone()[0] - 1.5) < 1e-9
+    assert syncer.backfill_prices(rt.pool, rt.conn, "a1") == {"pending": 0, "priced": 0}
+    assert rt.conn.execute("SELECT COUNT(*) FROM requests WHERE id=2001").fetchone()[0] == 1
+
+
+def test_price_backfill_failed_retries_until_recovered(env):
+    rt, state = env
+    state.add_item(2010, 200, 0, status="failed")
+    state.add_item(2011, 200, 0, status="ignored")
+    state.add_item(2012, 200, 0, status="not_billable")
+    syncer.sync_account(rt.pool, rt.conn, "a1")
+    rt.conn.execute("UPDATE requests SET user_id=222 WHERE id=2010")
+    rt.conn.commit()
+    first = syncer.backfill_prices(rt.pool, rt.conn, "a1")
+    assert first["pending"] == 1 and first["priced"] == 0
+    state.items = []
+    for rid in (2010, 2011, 2012):
+        state.add_item(rid, 200, 2.5, status="priced")
+    second = syncer.backfill_prices(rt.pool, rt.conn, "a1")
+    assert second["pending"] == 1 and second["priced"] == 1
+    row = rt.conn.execute("SELECT user_id,cost_usd,pricing_status FROM requests WHERE id=2010").fetchone()
+    assert tuple(row) == (222, 2.5, "priced")
+    assert rt.conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 3
+    for rid, status in ((2011, "ignored"), (2012, "not_billable")):
+        row = rt.conn.execute("SELECT cost_usd,pricing_status FROM requests WHERE id=?", (rid,)).fetchone()
+        assert tuple(row) == (None, status)
 
 
 def test_billing_split_exact_and_multiplier(env):
