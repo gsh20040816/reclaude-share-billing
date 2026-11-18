@@ -148,7 +148,7 @@ def period_overlaps(p, start, end):
 
 
 def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
-               idle_split: str = "none", note: str | None = None, *, _commit=True) -> int:
+               idle_split: str = "none", note: str | None = None, *, _commit=True, upstream_boundaries=False) -> int:
     if not conn.execute("SELECT 1 FROM billing_units WHERE id=?", (account_id,)).fetchone():
         raise ValueError("请使用已发现的 计费单元ID（/units 查看），不能使用登录标签")
     if not math.isfinite(cost_cny) or cost_cny < 0:
@@ -168,6 +168,9 @@ def add_period(conn, account_id: str, start: date, end: date, cost_cny: float,
            VALUES (?,?,?,?,?,?,?,?)""",
         (account_id, account_id, start.isoformat(), end.isoformat(), float(cost_cny), idle_split,
          note, time.strftime("%Y-%m-%dT%H:%M:%S")))
+    from . import compensations
+    compensations.apply(conn, account_id,
+                        included_period=cur.lastrowid if upstream_boundaries else None)
     if _commit:
         conn.commit()
     return cur.lastrowid

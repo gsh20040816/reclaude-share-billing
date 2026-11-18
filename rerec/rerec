@@ -270,7 +270,7 @@ def endpoint(url):
 
 
 def pair():
-    url = input("rerec 服务地址（含 /rerec）: ").strip()
+    url = os.environ.get("REREC_URL", "https://rerec.shgao.dev")
     endpoint(url)
     token = getpass.getpass("私聊 Bot 发送 /rerec 后得到的密钥: ").strip()
     if not token:
@@ -290,7 +290,7 @@ def api(**body):
     try:
         conn.request(
             "POST",
-            dest.path or "/rerec",
+            dest.path or "/",
             json.dumps(body),
             {"Content-Type": "application/json", "Authorization": "Bearer " + config["token"]},
         )

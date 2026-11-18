@@ -15,6 +15,11 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rerec_tokens (
+  token_id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS users (
   tg_user_id INTEGER PRIMARY KEY,
   handle     TEXT,
@@ -64,6 +69,20 @@ CREATE TABLE IF NOT EXISTS org_subscriptions (
 CREATE TABLE IF NOT EXISTS renewal_receipts (
   message_key TEXT PRIMARY KEY,
   period_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_compensations (
+  org_id INTEGER NOT NULL,
+  suspension_id INTEGER NOT NULL,
+  since_ms INTEGER NOT NULL,
+  compensated_ms INTEGER NOT NULL,
+  PRIMARY KEY(org_id, suspension_id)
+);
+CREATE TABLE IF NOT EXISTS period_compensations (
+  unit_id TEXT NOT NULL,
+  suspension_id INTEGER NOT NULL,
+  period_id INTEGER NOT NULL,
+  applied_ms INTEGER NOT NULL,
+  PRIMARY KEY(unit_id, suspension_id)
 );
 CREATE TABLE IF NOT EXISTS subscription_observations (
   id INTEGER PRIMARY KEY,

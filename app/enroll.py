@@ -68,11 +68,12 @@ def describe(pool, conn, state: str, account_id: str) -> dict:
 
 def enroll(pool, conn, *, state: str, tg_user_id: int, device_name: str,
            dry_run: bool = True, preferred_account: str | None = None,
-           actor: str | None = None, max_wait: float = 30.0) -> dict:
+           actor: str | None = None, max_wait: float = 30.0, selected=None) -> dict:
     from . import syncer
 
     try:
-        selected = allocation.choose(pool, conn, preferred_account)
+        if selected is None:
+            selected = allocation.choose(pool, conn, preferred_account)
     except allocation.NoCapacity as exc:
         raise NoSlot(str(exc)) from exc
     acc = store.account_row(conn, selected['account_id'])

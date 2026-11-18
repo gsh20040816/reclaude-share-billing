@@ -60,7 +60,7 @@ def rank(candidates, *, allow_exhausted=False):
         c['device_count'], c['org_id'], c['account_id']))
 
 
-def collect(pool, conn, preferred=None):
+def inventory(pool, conn, preferred=None):
     now = store.now_ms()
     candidates = []
     errors = []
@@ -84,7 +84,7 @@ def collect(pool, conn, preferred=None):
                 if quota.get('account_org_id') != own_org:
                     continue
             # Credential-level limit and own-account limit are different scopes.
-            platform = next((p for p in quota.get('by_platform', []) if p.get('platform') == 'claude'), quota)
+            platform = next((p for p in quota.get('by_platform', []) if p.get('platform') == 'claude'), {} if quota.get('by_platform') else quota)
             used, cap = number(platform.get('used')), number(platform.get('max'))
             if used is None or cap is None:
                 continue  # never infer free device slots from a missing response
@@ -96,9 +96,13 @@ def collect(pool, conn, preferred=None):
                     continue
                 if org.get('subscription_expires_at') and org['subscription_expires_at'] <= now:
                     continue
+                if cap < 1 or used > cap:
+                    continue
                 available = used < cap
                 au, ac = number(quota.get('account_used')), number(quota.get('account_max'))
-                available = available and au is not None and ac is not None and au < ac
+                if au is None or ac is None or ac < 1 or au > ac:
+                    continue
+                available = available and au < ac
                 tier = account.get('subscription_type')
                 scale = store.get_float(conn, f'allocation_capacity:{tier}', {'max_5x':5, 'max_20x':20}.get(tier, 1))
                 scale = scale if math.isfinite(scale) and scale > 0 else 1
@@ -108,9 +112,17 @@ def collect(pool, conn, preferred=None):
                 candidates.append(dict(account_id=login['id'], org_id=org['id'], upstream_account_id=account['id'],
                                        pressure=pressure(account, store.now_ms()), normalized_usage=usage/scale,
                                        usage_7d_usd=usage, capacity_scale=scale, available=available,
+                                       account=account, devices=devices, login_full=used >= cap, org_full=au >= ac,
                                        device_count=sum(d.get('org_id') == org['id'] for d in devices)))
         except Exception as exc:
             errors.append(f"{login['id']}: {type(exc).__name__}")
+    return candidates, errors
+
+
+def collect(pool, conn, preferred=None):
+    candidates, errors = inventory(pool, conn, preferred)
+    for candidate in candidates:
+        del candidate['account'], candidate['devices'], candidate['login_full'], candidate['org_full']
     # Same upstream/org through several login credentials is a single candidate.
     result = []
     seen = set()

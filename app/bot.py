@@ -116,6 +116,9 @@ class Bot:
         except Exception as exc:
             # A temporary menu API failure must not stop billing/long polling.
             print(f"menu setup failed ({type(exc).__name__}); retry on restart", flush=True)
+        if self.cfg.get("rerec_port"):
+            from .rerec_http import serve
+            self.rerec_server = serve(self, self.cfg["rerec_port"])
         threading.Thread(target=self.sync_loop, daemon=True).start()
         offset = None
         while not self._stop.is_set():
@@ -168,6 +171,9 @@ class Bot:
 
     def stop(self) -> None:
         self._stop.set()
+        if hasattr(self, "rerec_server"):
+            self.rerec_server.shutdown()
+            self.rerec_server.server_close()
         for worker in self._workers.values():
             worker.shutdown(wait=True)
 
@@ -226,7 +232,7 @@ class Bot:
             "/quota": self.cmd_quota, "/id": self.cmd_id, "/start": self.cmd_help, "/help": self.cmd_help,
             "/cancel": self.cmd_cancel,
             "/me": self.cmd_me, "/devices": self.cmd_devices, "/bill": self.cmd_bill,
-            "/login": self.cmd_login,
+            "/login": self.cmd_login, "/rerec": self.cmd_rerec,
             "/renew": self.cmd_renew, "/unit_link": self.cmd_unit_link, "/units": self.cmd_units, "/accounts": self.cmd_accounts, "/account_add": self.cmd_account_add,
             "/account_del": self.cmd_account_del, "/period": self.cmd_period,
             "/periods": self.cmd_periods, "/rate": self.cmd_rate, "/rates": self.cmd_rates,
@@ -401,6 +407,23 @@ class Bot:
             self.tg.send(chat["id"], "\n".join(lines), thread)
         if not mine:
             self.tg.send(chat["id"], "\n".join(lines), thread)
+
+    def cmd_rerec(self, chat, msg, uid, args, thread):
+        from .rerec import issue_token
+        if chat.get('type') != 'private':
+            self.tg.send(chat['id'], '请私聊 Bot 发送 /rerec 配对终端', thread)
+            return
+        if args == ['reset']:
+            self.conn.execute('DELETE FROM rerec_tokens WHERE user_id=?', (uid,))
+            self.conn.commit()
+            self.tg.send(uid, '你的所有 rerec 配对已撤销')
+            return
+        if not self.cfg.get('rerec_port'):
+            self.tg.send(uid, '管理员还没启用 rerec 服务')
+            return
+        token = issue_token(self.conn, uid)
+        self.tg.send(uid, f'在本机跑 rerec pair，然后输入配对密钥：<code>{token}</code>。'
+                     '私聊 /rerec reset 可撤销你的全部密钥。')
 
     def cmd_login(self, chat, msg, uid, args, thread) -> None:
         if not 1 <= len(args) <= 2:
@@ -577,11 +600,13 @@ class Bot:
         split = args[5] if len(args) > 5 else "none"
         try:
             if s == 'auto' and e == 'auto':
+                ledger.renewal_expiry(self.pool, self.conn, aid)
                 start, end = billing.automatic_boundaries(self.conn, aid)
             else:
                 start, end = billing.parse_boundary(s), billing.parse_boundary(e)
             pid = billing.add_period(self.conn, aid, start, end,
-                                     float(cost), idle_split=split)
+                                     float(cost), idle_split=split,
+                                     upstream_boundaries=(s == e == 'auto'))
         except Exception as exc:                 # noqa: BLE001
             self.tg.send(chat["id"], f"❌ {esc(exc)}", thread)
             return

@@ -47,6 +47,10 @@ class FakeClient:
         self.cookie = "rc_sid=fake-cookie"
 
     def get(self, path):
+        if path.startswith("/api/app/notifications?"):
+            return []
+        if path.startswith("/api/app/me?"):
+            return {}
         if path == "/api/app/orgs/":
             return {"items": [{"id": 1, "role": "owner", "current_account": {"id": 101, "status": "bound"}}]}
         if path.startswith("/api/app/devices/quota"):

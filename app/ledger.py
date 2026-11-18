@@ -128,7 +128,13 @@ def renewal_expiry(pool, conn, unit_id):
             own = session.device_quota().get('account_org_id')
             if own != unit['org_id']:
                 continue
-            org = next((o for o in session.get('/api/app/orgs/').get('items', []) if o['id'] == own), None)
+            orgs = session.get('/api/app/orgs/')
+            org = next((o for o in orgs.get('items', []) if o['id'] == own), None)
+            if org:
+                from . import compensations
+                observe(conn, org)
+                observe_own_start(conn, own, orgs, session.get(f'/api/app/me?org_id={own}'))
+                compensations.sync(session, conn, own)
         if not org:
             continue
         end = org.get('subscription_expires_at')

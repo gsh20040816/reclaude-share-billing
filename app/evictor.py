@@ -60,7 +60,8 @@ def flush_device(pool, conn, account_id: str, rc_device_id: int) -> dict:
 
 @serialized_account
 def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manual",
-          actor: str | None = None, dry_run: bool = True, force: bool = False) -> dict:
+          actor: str | None = None, dry_run: bool = True, force: bool = False,
+          before_revoke=None) -> dict:
     row = conn.execute("SELECT * FROM devices WHERE account_id=? AND rc_device_id=?",
                        (account_id, rc_device_id)).fetchone()
     if row is None:
@@ -91,6 +92,11 @@ def evict(pool, conn, account_id: str, rc_device_id: int, *, reason: str = "manu
             if flush.get('error') or any((flush.get(k) or {}).get('truncated') for k in ('first', 'second')):
                 raise EvictionError('请求同步未完成，取消自动撤销')
             _check_live_idle(pool, conn, account_id, rc_device_id)
+            if before_revoke is not None and not before_revoke():
+                conn.execute("UPDATE devices SET state='active' WHERE account_id=? AND rc_device_id=?",
+                             (account_id, rc_device_id))
+                conn.commit()
+                return dict(plan, skipped="已有空位")
         with pool.session(account_id) as s:
             s.revoke(rc_device_id)
     except Exception as exc:                     # noqa: BLE001

@@ -208,6 +208,11 @@ def sync_account(pool, conn, account_id: str, since_ms=None, until_ms=None,
                     ledger.observe_own_start(conn, own, orgs, s.get(f"/api/app/me?org_id={own}"))
             except Exception:                     # 设备列表失败不阻塞流水采集
                 conn.rollback()
+        if device_id is None:
+            from . import compensations
+            owner = store.account_row(conn, account_id)['own_org_id']
+            if owner is not None:
+                compensations.sync(s, conn, owner)
         cursor = progress["cursor"] if progress else None
         while pages < max_pages:
             page = s.history(since=since, until=until, cursor=cursor, limit=limit,
