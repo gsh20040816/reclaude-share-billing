@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pass Python on fd 3 so interactive prompts can still read stdin.
+client() {
+  python3 /dev/fd/3 "$@" 3<<'REREC_PYTHON'
+"""Structured status, authorization handoff and local migration for the Bash CLI."""
+
+import getpass
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+import filecmp
+import shutil
+
+REC = os.environ.get("REREC_REC", "reclaude")
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "rerec" / "client.json"
+
+
+TREES = ('projects', 'file-history', 'skills', 'memory')
+# Persist only portable Agents list metadata, never providerEnv, pid, sock,
+# daemonShort, bridge identity, permissions or execution flags.
+JOB_FIELDS = frozenset('''state detail template intent displayIntent name nameSource
+color sessionId resumeSessionId cwd originCwd createdAt updatedAt firstTerminalAt
+lastTerminalAt output children tokens interactiveLineage worktreePath worktreeBranch
+forkSessionId forkParentSessionId group pinned sortOrder stateSortOrder'''.split())
+SETTINGS = ('attribution', 'includeCoAuthoredBy', 'theme', 'modelSettings', 'model',
+            'enabledPlugins', 'extraKnownMarketplaces')
+
+
+def revision(path):
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def safe_path(root, relative):
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f'Symlink is not allowed: {current}')
+    return current
+
+
+def read_object(path):
+    obj = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(obj, dict):
+        raise ValueError(f'Expected JSON object: {path}')
+    return obj
+
+
+def plan(source, target, include_hooks=False):
+    # Resolve neither symlinks nor identical/nested directories silently.
+    for root in (source, target):
+        if not root.is_dir() or root.is_symlink() or root.resolve() != root.absolute():
+            raise ValueError(f'Expected real absolute device directory: {root}')
+    if source == target or source in target.parents or target in source.parents:
+        raise ValueError('Source and target must be distinct, non-nested directories')
+    src, dst = safe_path(source, Path('config')), safe_path(target, Path('config'))
+    if not src.is_dir() or not dst.is_dir():
+        raise ValueError('Both device directories must already contain config/')
+    operations, conflicts, skipped = [], [], []
+    for tree in TREES:
+        base = safe_path(src, Path(tree))
+        if not base.exists():
+            continue
+        for directory, dirs, files in os.walk(base, followlinks=False):
+            folder = Path(directory)
+            for name in list(dirs):
+                child = folder / name
+                if child.is_symlink() or (tree == 'skills' and child == base / 'synced'):
+                    dirs.remove(name)
+                    skipped.append(str(child.relative_to(src)))
+            for name in sorted(files):
+                old = folder / name
+                rel = old.relative_to(src)
+                if old.is_symlink() or (tree == 'skills' and old == base / 'synced'):
+                    skipped.append(str(rel))
+                    continue
+                new = safe_path(dst, rel)
+                source_revision = revision(old)
+                if new.exists():
+                    if not new.is_file():
+                        conflicts.append(str(rel))
+                    elif not filecmp.cmp(old, new, shallow=False):
+                        operations.append((rel, old, None, source_revision, revision(new)))
+                else:
+                    operations.append((rel, old, None, source_revision, None))
+    # Mirror files only inside present source whitelist trees. The protected
+    # synced subtree and symlink subtrees are never traversed or deleted.
+    for tree in TREES:
+        base = safe_path(src, Path(tree))
+        dest = safe_path(dst, Path(tree))
+        if not base.is_dir() or not dest.is_dir():
+            continue
+        for directory, dirs, files in os.walk(dest, followlinks=False):
+            folder = Path(directory)
+            for name in list(dirs):
+                child = folder / name
+                rel = child.relative_to(dst)
+                if (child.is_symlink() or
+                    (tree == 'skills' and child == dest / 'synced') or
+                    any(rel == Path(x) or Path(x) in rel.parents for x in skipped)):
+                    dirs.remove(name)
+            for name in sorted(files):
+                target_file = folder / name
+                rel = target_file.relative_to(dst)
+                if target_file.is_symlink() or (tree == 'skills' and target_file == dest / 'synced'):
+                    skipped.append(str(rel))
+                    continue
+                source_file = src / rel
+                if not source_file.exists() and not source_file.is_symlink():
+                    operations.append((rel, None, None, None, revision(target_file)))
+    history = Path('history.jsonl')
+    old, new = safe_path(src, history), safe_path(dst, history)
+    if old.exists():
+        data = old.read_bytes()
+        if not new.exists() or new.read_bytes() != data:
+            operations.append((history, None, data, None, revision(new) if new.exists() else None))
+    settings = Path('settings.json')
+    old, new = safe_path(src, settings), safe_path(dst, settings)
+    if old.exists():
+        source_settings, target_settings = read_object(old), read_object(new)
+        selected = {k: v for k, v in source_settings.items() if k in SETTINGS}
+        # Hooks execute local commands. Explicit opt-in; paths are never rewritten.
+        if include_hooks and 'hooks' in source_settings:
+            selected['hooks'] = source_settings['hooks']
+        merged = dict(target_settings)
+        merged.update(selected)
+        if merged != target_settings:
+            data = (json.dumps(merged, ensure_ascii=False, indent=2) + '\n').encode()
+            operations.append((settings, None, data, None, revision(new) if new.exists() else None))
+    config = Path('.claude.json')
+    old, new = safe_path(src, config), safe_path(dst, config)
+    if old.exists():
+        trusted = [path for path, entry in read_object(old).get('projects', {}).items()
+                   if entry.get('hasTrustDialogAccepted') is True]
+        merged = read_object(new)
+        changed = False
+        for path in trusted:
+            project = merged.setdefault('projects', {}).setdefault(path, {})
+            if project.get('hasTrustDialogAccepted') is not True:
+                project['hasTrustDialogAccepted'] = True
+                changed = True
+        if changed:
+            data = (json.dumps(merged, ensure_ascii=False, indent=2) + '\n').encode()
+            operations.append((config, None, data, None, revision(new) if new.exists() else None))
+    source_job_ids = set()
+    jobs = safe_path(src, Path('jobs'))
+    if jobs.is_dir():
+        for folder in sorted(jobs.iterdir()):
+            if not re.fullmatch(r'[a-f0-9]{8}', folder.name):
+                continue
+            rel = Path('jobs') / folder.name / 'state.json'
+            old = safe_path(src, rel)
+            if not old.is_file():
+                continue
+            source_job_ids.add(folder.name)
+            original = read_object(old)
+            required = ('state', 'detail', 'template', 'intent', 'sessionId',
+                        'cwd', 'createdAt', 'updatedAt')
+            if not all(isinstance(original.get(k), str) for k in required):
+                raise ValueError(f'Invalid Agents state: {rel}')
+            portable = {k: v for k, v in original.items() if k in JOB_FIELDS}
+            # Imported rows are historical; no source process is alive here.
+            if portable['state'] not in ('done', 'failed', 'stopped'):
+                portable['state'] = 'stopped'
+            portable['tempo'] = 'idle'
+            portable['respawnFlags'] = []
+            data = (json.dumps(portable, ensure_ascii=False, indent=2) + '\n').encode()
+            new = safe_path(dst, rel)
+            if new.exists() and not new.is_file():
+                conflicts.append(str(rel))
+            elif not new.exists() or new.read_bytes() != data:
+                operations.append((rel, None, data, None,
+                                   revision(new) if new.exists() else None))
+    # Mirror only the Agents list records. Do not touch job runtime files,
+    # credentials, logs, or unrecognized entries outside this whitelist.
+    target_jobs = safe_path(dst, Path('jobs'))
+    if target_jobs.is_dir():
+        for folder in sorted(target_jobs.iterdir()):
+            if (not re.fullmatch(r'[a-f0-9]{8}', folder.name)
+                    or folder.name in source_job_ids):
+                continue
+            rel = Path('jobs') / folder.name / 'state.json'
+            old = safe_path(dst, rel)
+            if old.is_file():
+                operations.append((rel, None, None, None, revision(old)))
+            elif old.exists():
+                conflicts.append(str(rel))
+    return dst, operations, conflicts, skipped
+
+
+def apply_plan(dst, operations, backup_root):
+    """Back up overwritten files, write atomically; rollback this run on failure."""
+    backup_root.mkdir(mode=0o700)
+    manifest = []
+    try:
+        for rel, source, data, expected_source, expected_target in operations:
+            target = safe_path(dst, rel)
+            if (revision(target) if target.exists() else None) != expected_target:
+                raise ValueError(f'Target changed after preview: {rel}')
+            if source and revision(source) != expected_source:
+                raise ValueError(f'Source changed after preview: {rel}')
+            if target.exists():
+                backup = backup_root / rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+            if source is None and data is None:
+                target.unlink()
+                manifest.append({'path': str(rel), 'overwritten': True})
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix='.rec-migrate-', dir=target.parent)
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    if source:
+                        with source.open('rb') as inp:
+                            shutil.copyfileobj(inp, f)
+                    else:
+                        f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if source:
+                    os.chmod(tmp, source.stat().st_mode & 0o777)
+                os.replace(tmp, target)
+                manifest.append({'path':str(rel), 'overwritten':expected_target is not None})
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        (backup_root / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+    except BaseException:
+        for entry in reversed(manifest):
+            target = dst / entry['path']
+            if entry['overwritten']:
+                shutil.copy2(backup_root / entry['path'], target)
+            else:
+                target.unlink()
+        raise
+
+
+
+def write_json(path, obj):
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def endpoint(url):
+    dest = urlsplit(url)
+    local = dest.hostname in ("localhost", "127.0.0.1", "::1")
+    if not dest.hostname or dest.username or dest.password or dest.query or dest.fragment:
+        raise ValueError("请输入完整的 rerec 服务地址")
+    if dest.scheme != "https" and not (local and dest.scheme == "http"):
+        raise ValueError("远程 rerec 服务需要 HTTPS")
+    return dest
+
+
+def pair():
+    url = input("rerec 服务地址（含 /rerec）: ").strip()
+    endpoint(url)
+    token = getpass.getpass("私聊 Bot 发送 /rerec 后得到的密钥: ").strip()
+    if not token:
+        raise ValueError("密钥为空")
+    CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_json(CONFIG, dict(url=url, token=token))
+
+
+def api(**body):
+    if not CONFIG.exists():
+        raise ValueError("请先运行 rerec pair")
+    config = json.loads(CONFIG.read_text())
+    dest = endpoint(config["url"])
+    conn = (http.client.HTTPSConnection if dest.scheme == "https" else http.client.HTTPConnection)(
+        dest.hostname, dest.port, timeout=240
+    )
+    try:
+        conn.request(
+            "POST",
+            dest.path or "/rerec",
+            json.dumps(body),
+            {"Content-Type": "application/json", "Authorization": "Bearer " + config["token"]},
+        )
+        response = conn.getresponse()
+        if response.status != 200:
+            message = response.read()
+            if response.getheader("Content-Type", "").startswith("application/json"):
+                raise ValueError(json.loads(message)["error"])
+            raise ValueError(f"rerec 服务返回 HTTP {response.status}")
+        return json.load(response)
+    finally:
+        conn.close()
+
+
+def status():
+    return json.loads(subprocess.check_output([REC, "status", "--check", "--json"]))
+
+
+def authorize(command, args):
+    # ReClaude prints its URL and waits for approval in this same process.
+    pattern = re.compile(r"https://(?:www\.)?reclaude\.ai/cli/auth\?state=([A-Za-z0-9_-]+)")
+    proc = subprocess.Popen(
+        [REC, *command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    sent = False
+    try:
+        for line in proc.stdout:
+            match = pattern.search(line)
+            if match and not sent:
+                api(action="approve", state=match.group(1), **args)
+                sent = True
+            elif not match:
+                print(line, end="", file=sys.stderr)
+        if proc.wait():
+            raise ValueError("ReClaude 登录失败")
+        if not sent:
+            raise ValueError("ReClaude 没有发起预期的设备授权")
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def processes():
+    output = subprocess.check_output(["ps", "-U", str(os.getuid()), "-o", "pid=,comm="], text=True)
+    found = set()
+    for line in output.splitlines():
+        pid, name = line.strip().split(None, 1)
+        base = Path(name).name
+        if base in ("claude", "reclaude", "rec") or name.startswith("claude "):
+            found.add(int(pid))
+    return found
+
+
+def stop_clients():
+    for sig, grace in [(signal.SIGTERM, 5), (signal.SIGKILL, 2)]:
+        for pid in processes():
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                continue
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not processes():
+                return
+            time.sleep(0.2)
+    raise ValueError("仍有 Claude/ReClaude 进程，迁移已暂停")
+
+
+def finish(path, job, snapshot):
+    target = job["target"]
+    base = Path(snapshot["global"]["data_dir"]) / "claude" / "accounts"
+    source_dir, target_dir = base / str(job["source"]), base / str(target)
+    if not (target_dir / "config").is_dir():
+        raise ValueError("新设备目录还没创建，保留迁移进度")
+    subprocess.run([REC, "org", "use", str(job["org"])], check=True)
+    current = status()["claude"]
+    if (
+        current.get("login", {}).get("state") != "valid"
+        or (current.get("current") or {}).get("device_id") != target
+    ):
+        subprocess.run([REC, "org", "use", str(job["source_org"])], check=True)
+        path.unlink()
+        raise ValueError("目标绑定不可用，已切回原组织")
+    stop_clients()
+    dst, ops, conflicts, _ = plan(source_dir, target_dir)
+    if conflicts:
+        raise ValueError("迁移遇到文件类型冲突：" + ", ".join(conflicts))
+    if ops:
+        apply_plan(dst, ops, target_dir / (".migration-backup-" + str(time.time_ns())))
+    path.unlink()
+
+
+def prepare(mode, model, directory):
+    path = Path(directory) / "migration.json"
+    snapshot = status()
+    claude = snapshot["claude"]
+    bindings = claude.get("bindings") or []
+    current = claude.get("current") or {}
+    job = json.loads(path.read_text()) if path.exists() else None
+    if job:
+        # org bind preserves the default. Recover even if interrupted immediately
+        # after the official client saved the new binding.
+        if not job.get("target"):
+            recovered = next(
+                (
+                    b
+                    for b in bindings
+                    if b["org_id"] == job["org"] and b["device_id"] not in job["before"]
+                ),
+                None,
+            )
+            if recovered:
+                job["target"] = recovered["device_id"]
+                write_json(path, job)
+        if job.get("target"):
+            finish(path, job, snapshot)
+            return
+        path.unlink()
+    valid = claude.get("login", {}).get("state") == "valid"
+    if mode != "switch" and valid:
+        return
+    switching = mode == "switch"
+    if switching and not current.get("device_id"):
+        raise ValueError("请先运行 rerec login")
+    args = dict(
+        model=model,
+        source=current["org_id"] if switching else 0,
+        device=current["device_id"] if switching else 0,
+        bindings=[b["device_id"] for b in bindings],
+    )
+    selected = api(action="plan", **args)
+    victim = selected.get("victim")
+    if victim:
+        print(f"待释放设备 {victim['id']}，已闲置 {victim['idle_minutes']} 分钟", file=sys.stderr)
+        if victim["own"] and input("下线自己的这台设备？[y/N] ").lower() != "y":
+            if input("保留自己的设备，继续查找可自动释放的其他设备？[y/N] ").lower() != "y":
+                raise ValueError("已取消换号")
+            args["skip_own"] = True
+            selected = api(action="plan", **args)
+            victim = selected.get("victim")
+            if victim:
+                print(
+                    f"待释放设备 {victim['id']}，已闲置 {victim['idle_minutes']} 分钟", file=sys.stderr
+                )
+    org = selected["org_id"]
+    target = selected.get("reuse")
+    if switching:
+        job = dict(
+            org=org,
+            source_org=current["org_id"],
+            source=current["device_id"],
+            target=target,
+            before=args["bindings"],
+        )
+        write_json(path, job)
+    if not target:
+        command = ["login"]
+        if switching or current:
+            command = (
+                ["login", "--org", str(org)]
+                if any(b["org_id"] == org for b in bindings)
+                else ["org", "bind", str(org)]
+            )
+        authorize(
+            command,
+            dict(args, account=selected["account_id"], org=org, victim=victim),
+        )
+        snapshot = status()
+        bound = next((b for b in snapshot["claude"].get("bindings") or [] if b["org_id"] == org), None)
+        if not bound:
+            raise ValueError("授权已批准，还没找到本机目标绑定")
+        target = bound["device_id"]
+    if switching:
+        job["target"] = target
+        write_json(path, job)
+        finish(path, job, snapshot)
+    else:
+        if (snapshot["claude"].get("current") or {}).get("device_id") != target:
+            subprocess.run([REC, "org", "use", str(org)], check=True)
+        if status()["claude"].get("login", {}).get("state") != "valid":
+            raise ValueError("本机绑定还没就绪")
+        print("本机登录成功。设备归属由服务端同步。", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        if sys.argv[1] == "pair":
+            pair()
+        else:
+            prepare(*sys.argv[2:])
+    except (ValueError, OSError, subprocess.SubprocessError) as e:
+        sys.exit(str(e))
+REREC_PYTHON
+}
+
+rec=${REREC_REC:-reclaude}
+case ${1:-} in
+  -h|--help|help)
+    echo 'rerec [Claude 参数...] | rerec pair | rerec login | rerec switch [模型]'
+    exit ;;
+  pair)
+    client pair; exit ;;
+esac
+umask 077
+state=${XDG_STATE_HOME:-"$HOME/.local/state"}/rerec
+mkdir -p "$state"
+exec 9>"$state/lock"
+# The shell owns fd 9 throughout preparation, including the Python children.
+python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'
+mode=start
+model=''
+case ${1:-} in
+  switch)
+    mode=switch
+    shift
+    model=${1:-}
+    if [[ -z $model && ! -f "$state/migration.json" ]]; then
+      read -rp '目标模型（例如 fable、opus 或 sonnet）: ' model
+      [[ -n $model ]]
+    fi
+    if (( $# > 0 )); then shift; fi ;;
+  login) mode=login; shift ;;
+esac
+client prepare "$mode" "$model" "$state"
+exec 9>&-
+if [[ $mode != login ]]; then
+  if [[ $mode == switch && -n $model && $model != other ]]; then
+    exec "$rec" cli --model "$model" "$@"
+  fi
+  exec "$rec" cli "$@"
+fi

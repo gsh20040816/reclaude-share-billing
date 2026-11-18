@@ -14,6 +14,16 @@ evict the least-recently-used device when slots run out, split the account cost 
                             └── 每 5 分钟 ──拉请求流水──▶ SQLite ──▶ 账单
 ```
 
+## 安装 rerec 客户端
+
+macOS 和 Linux 用同一条命令，Intel 和 ARM 通用。先准备好 Bash、Python 3.10+ 和官方 `reclaude`，再安装或更新：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gsh20040816/reclaude-share-billing/main/rerec/install.sh | bash
+```
+
+安装后跑 `rerec --help`。已有有效绑定时，直接跑 `rerec` 就能启动 Claude Code。首次自动登录和按模型换号需要先跟服务端配对，见 [rerec 用法](rerec/README.md)。
+
 ## 为什么不是"中转计费"
 
 ReClaude 不发模型 API key：它给每个人分配真实的 Anthropic 订阅账号，Claude Code 直连官方。
