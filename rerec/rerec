@@ -94,8 +94,9 @@ def read_object(path):
 def plan(source, target, include_hooks=False):
     # Resolve neither symlinks nor identical/nested directories silently.
     for root in (source, target):
-        if not root.is_dir() or linked(root) or root.resolve() != root.absolute():
+        if not root.is_absolute() or not root.is_dir() or any(linked(p) for p in (root, *root.parents)):
             raise ValueError(f'Expected real absolute device directory: {root}')
+    source, target = source.resolve(), target.resolve()
     if source == target or source in target.parents or target in source.parents:
         raise ValueError('Source and target must be distinct, non-nested directories')
     src, dst = safe_path(source, Path('config')), safe_path(target, Path('config'))
