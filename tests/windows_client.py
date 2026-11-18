@@ -40,6 +40,8 @@ elif args[0]=='cli': (p/'launch').write_text(json.dumps(args[1:]))
 else: sys.exit(2)
 """)
     (root / "active").write_text("0")
+    (root / ".claude").mkdir()
+    (root / ".claude/CLAUDE.md").write_text("shared")
     before, after = [root / "claude" / "accounts" / str(i) / "config" for i in (10, 20)]
     before.mkdir(parents=True)
     after.mkdir(parents=True)
@@ -48,7 +50,7 @@ else: sys.exit(2)
     endpoint = HTTPServer(("127.0.0.1", 0), Endpoint)
     threading.Thread(target=endpoint.serve_forever, daemon=True).start()
     bash = Path(os.environ['ProgramFiles']) / 'Git/bin/bash.exe'
-    env = dict(os.environ, REREC_URL=f"http://127.0.0.1:{endpoint.server_port}", REREC_REC=str(rec),
+    env = dict(os.environ, USERPROFILE=str(root), HOME=str(root), REREC_URL=f"http://127.0.0.1:{endpoint.server_port}", REREC_REC=str(rec),
                XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
     def run(*args, **kwargs):
         return subprocess.run([bash, "./rerec", *args], cwd=root, env=env, check=True, timeout=90, **kwargs)
@@ -57,6 +59,8 @@ else: sys.exit(2)
         run("login")
         run("switch", "fable")
         assert json.loads((root / "launch").read_text()) == ["--model", "fable"]
+        assert (after / "CLAUDE.md").is_symlink()
+        assert (after / "CLAUDE.md").read_text() == "shared"
         assert (after / "history.jsonl").read_text(encoding="utf-8") == "你好\n"
         assert json.loads((after / ".claude.json").read_text())["projects"][str(root)]["hasTrustDialogAccepted"]
     finally:

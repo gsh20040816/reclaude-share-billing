@@ -152,6 +152,16 @@ def test_bash_switch_migrates_and_launches(tmp_path, bot, monkeypatch):
         json.dumps({"auth": "target", "projects": {"/work": {"y": 8}}})
     )
     (source / "config/history.jsonl").write_text("a session\n")
+    shared = tmp_path / ".claude"
+    shared.mkdir()
+    (shared / "CLAUDE.md").write_text("common")
+    (source / "config/CLAUDE.md").write_text("old rules")
+    for name in ("mine", "synced"):
+        (source / "config/skills" / name).mkdir(parents=True)
+        (source / "config/skills" / name / "SKILL.md").write_text(name)
+    memory = Path("projects/work/memory")
+    (source / "config" / memory).mkdir(parents=True)
+    (source / "config" / memory / "MEMORY.md").write_text("project")
     active = tmp_path / "current"
     active.write_text("90")
     rec = tmp_path / "fake-rec"
@@ -195,6 +205,7 @@ else:sys.exit(2)
     )
     env = dict(
         os.environ,
+        HOME=str(tmp_path),
         TEST_DIR=str(tmp_path),
         REREC_REC=str(rec),
         XDG_CONFIG_HOME=str(tmp_path / "config"),
@@ -203,6 +214,17 @@ else:sys.exit(2)
     )
     try:
         subprocess.run([ROOT / "rerec/rerec", "switch", "fable"], env=env, check=True, timeout=15)
+        for account in (source, target):
+            assert (account / "config/CLAUDE.md").readlink() == shared / "CLAUDE.md"
+            assert (account / "config/skills/mine").readlink() == shared / "skills/mine"
+        assert next(source.glob(".rerec-link-backup-*/CLAUDE.md")).read_text() == "old rules"
+        assert not (shared / "skills/synced").exists()
+        assert not (target / "config" / memory).is_symlink()
+        assert (target / "config" / memory / "MEMORY.md").read_text() == "project"
+        (config / "migration.json").write_text(json.dumps({"links": ["skills"]}))
+        subprocess.run([ROOT / "rerec/rerec", "login"],env=env,check=True)
+        assert not (target / "config/CLAUDE.md").is_symlink()
+        assert (target / "config/CLAUDE.md").read_text() == "common"
         assert (target / "config/history.jsonl").read_text() == "a session\n"
         assert json.loads((target / "config/.claude.json").read_text()) == {
             "auth": "target",
@@ -230,10 +252,11 @@ import json,os,pathlib,sys
 p=pathlib.Path(os.environ['FAKE_CURRENT'])
 if sys.argv[1]=='status':
     current={'org_id':1,'device_id':123} if p.exists() else {}
-    print(json.dumps({'claude':{'current':current,'bindings':[current] if current else [],
+    print(json.dumps({'global':{'data_dir':str(p.parent/'data')},'claude':{'current':current,'bindings':[current] if current else [],
                      'login':{'state':'valid' if current else 'none'}}}))
 elif sys.argv[1]=='login':
     print('https://www.reclaude.ai/cli/auth?state=my-test-state',flush=True)
+    (p.parent/'data/claude/accounts/123/config').mkdir(parents=True)
     p.write_text('123')
 elif sys.argv[1]=='cli':
     print('launched')
@@ -243,6 +266,7 @@ else:sys.exit(2)
     env = dict(
         os.environ,
         REREC_REC=str(rec),
+        HOME=str(tmp_path),
         FAKE_CURRENT=str(tmp_path / "current"),
         XDG_CONFIG_HOME=str(tmp_path / "config"),
         XDG_STATE_HOME=str(tmp_path / "state"),

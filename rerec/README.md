@@ -10,3 +10,9 @@ macOS、Linux 和 Windows 共用同一个单文件客户端。Windows 需要 Git
 4. 换号会停止本用户的 Claude/ReClaude 终端进程，包括其他终端里的会话，等待退出后再迁移。历史会话可通过 Claude Code 的恢复入口打开。脚本沿用原迁移工具的白名单镜像策略：以来源账号为准，覆盖目标中的同名历史，并清理只在目标白名单目录内的文件。覆盖和清理前在目标账号目录保存备份。项目目录信任按路径合并，目标设备凭据保留。中断后重新跑 rerec 可接着处理已建立的目标绑定。
 
 本地配置在 `~/.config/rerec/client.json`，切换进度放在 `~/.local/state/rerec/`，支持 XDG_CONFIG_HOME 和 XDG_STATE_HOME。
+
+### 与普通 Claude Code 共用配置
+
+共享源是本机的 `~/.claude/`。启动、登录或换号时，rerec 把账号里对应的条目链接到这里。默认共用 `CLAUDE.md`、`agents/`、`commands/`、`output-styles/`、`hooks/`、`scripts/`、`handoff/`、`keybindings.json` 和各个自定义 skill。账号独有的文件会补到共享目录；同名内容不同用共享版，账号原件保存在该设备目录的 `.rerec-link-backup-*`。已有的用户自建链接保留。新建的 skill 在下次启动时接入；`skills/synced/` 留在各账号。项目记忆继续随历史复制，模型和代理设置沿用账号配置。链接 hooks 目录不会自动启用其中的脚本。
+
+可在 `~/.config/rerec/migration.json` 通过 `links` 数组选择上述条目，例如 `{"links":["CLAUDE.md","skills"]}`。省略该字段采用默认清单。移出清单后，该账号下次启动会把原受管链接还原为独立副本。关闭 skills 共享时，换号沿用原来的 skills 复制逻辑。Windows 创建符号链接需要启用“开发人员模式”或具备创建符号链接的权限。

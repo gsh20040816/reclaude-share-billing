@@ -50,7 +50,9 @@ REC = os.environ.get("REREC_REC", "reclaude")
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "rerec" / "client.json"
 
 
-TREES = ('projects', 'file-history', 'skills', 'memory')
+LINK_ITEMS = ('CLAUDE.md', 'agents', 'commands', 'output-styles', 'hooks', 'scripts',
+              'handoff', 'keybindings.json', 'skills')
+TREES = ('projects', 'file-history', 'memory')
 # Persist only portable Agents list metadata, never providerEnv, pid, sock,
 # daemonShort, bridge identity, permissions or execution flags.
 JOB_FIELDS = frozenset('''state detail template intent displayIntent name nameSource
@@ -91,7 +93,111 @@ def read_object(path):
     return obj
 
 
-def plan(source, target, include_hooks=False):
+def shared_items():
+    path = CONFIG.with_name("migration.json")
+    items = read_object(path).get("links", list(LINK_ITEMS))
+    if not isinstance(items, list) or any(item not in LINK_ITEMS for item in items):
+        raise ValueError(f"{path}: links 必须是受支持的共享项列表")
+    return set(items)
+
+
+def copy_entry(source, dest):
+    if source.is_dir() and not linked(source):
+        shutil.copytree(source, dest, symlinks=True)
+    elif source.is_symlink():
+        dest.symlink_to(source.readlink(), target_is_directory=source.is_dir())
+    elif linked(source):
+        raise ValueError(f"不支持导入此重解析点：{source}")
+    else:
+        shutil.copy2(source, dest)
+
+
+def merge_entry(source, dest):
+    """Import missing entries. Return whether a displaced version needs keeping."""
+    if not os.path.lexists(dest):
+        with tempfile.TemporaryDirectory(dir=dest.parent) as tmp:
+            staged = Path(tmp) / "new"
+            copy_entry(source, staged)
+            staged.rename(dest)
+        return False
+    if linked(source) or linked(dest):
+        return not (source.is_symlink() and dest.is_symlink() and source.readlink() == dest.readlink())
+    if source.is_dir() and dest.is_dir():
+        conflict = False
+        for child in source.iterdir():
+            conflict |= merge_entry(child, dest / child.name)
+        return conflict
+    return not (source.is_file() and dest.is_file() and filecmp.cmp(source, dest, shallow=False))
+
+
+def share_config(account, items):
+    local = safe_path(account, Path("config"))
+    if not local.is_dir():
+        raise ValueError(f"找不到账号配置目录：{local}")
+    shared = Path.home() / ".claude"
+    backup = account / (".rerec-link-backup-" + str(time.time_ns()))
+
+    def reconcile(rel, enabled):
+        src, dst = local / rel, shared / rel
+        if src.is_symlink() and src.readlink() == dst:
+            if enabled and dst.exists():
+                return
+            if not dst.exists():
+                src.unlink()
+                return
+            # Detach a previously managed link when its policy is disabled.
+            with tempfile.TemporaryDirectory(dir=src.parent) as tmp:
+                saved = Path(tmp) / "copy"
+                copy_entry(dst, saved)
+                src.unlink()
+                try:
+                    saved.rename(src)
+                except OSError:
+                    src.symlink_to(dst, target_is_directory=dst.is_dir())
+                    raise
+            return
+        if not enabled or not (os.path.lexists(src) or os.path.lexists(dst)):
+            return
+        if linked(src):
+            # User-installed links already have an owner. Accept equivalent
+            # relative links, leave unrelated links in place.
+            return
+        if linked(dst) and not dst.exists():
+            raise ValueError(f"共享源链接失效：{dst}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=src.parent) as tmp:
+            stage = Path(tmp)
+            new_link = stage / "link"
+            new_link.symlink_to(dst, target_is_directory=(dst if dst.exists() else src).is_dir())
+            old = stage / "old"
+            if src.exists():
+                conflict = merge_entry(src, dst)
+                if conflict:
+                    old = backup / rel
+                    old.parent.mkdir(parents=True, exist_ok=True)
+                src.rename(old)
+            try:
+                new_link.rename(src)
+            except OSError:
+                if old.exists():
+                    old.rename(src)
+                raise
+
+    for name in LINK_ITEMS:
+        if name != "skills":
+            reconcile(Path(name), name in items)
+            continue
+        private = safe_path(local, Path("skills"))
+        public = shared / "skills"
+        names = {p.name for folder in (private, public) if folder.is_dir() for p in folder.iterdir()}
+        for skill in sorted(names - {"synced"}):
+            reconcile(Path("skills") / skill, "skills" in items)
+    if backup.exists():
+        print(f"共享配置同名内容不同，账号原件保存在 {backup}", file=sys.stderr)
+
+
+def plan(source, target, include_hooks=False, *, trees=TREES):
     # Resolve neither symlinks nor identical/nested directories silently.
     for root in (source, target):
         if not root.is_absolute() or not root.is_dir() or any(linked(p) for p in (root, *root.parents)):
@@ -103,7 +209,7 @@ def plan(source, target, include_hooks=False):
     if not src.is_dir() or not dst.is_dir():
         raise ValueError('Both device directories must already contain config/')
     operations, conflicts, skipped = [], [], []
-    for tree in TREES:
+    for tree in trees:
         base = safe_path(src, Path(tree))
         if not base.exists():
             continue
@@ -131,7 +237,7 @@ def plan(source, target, include_hooks=False):
                     operations.append((rel, old, None, source_revision, None))
     # Mirror files only inside present source whitelist trees. The protected
     # synced subtree and symlink subtrees are never traversed or deleted.
-    for tree in TREES:
+    for tree in trees:
         base = safe_path(src, Path(tree))
         dest = safe_path(dst, Path(tree))
         if not base.is_dir() or not dest.is_dir():
@@ -442,7 +548,11 @@ def finish(path, job, snapshot):
         path.unlink()
         raise ValueError("目标绑定不可用，已切回原组织")
     stop_clients()
-    dst, ops, conflicts, _ = plan(source_dir, target_dir)
+    items = shared_items()
+    share_config(source_dir, items)
+    share_config(target_dir, items)
+    trees = TREES if "skills" in items else (*TREES, "skills")
+    dst, ops, conflicts, _ = plan(source_dir, target_dir, trees=trees)
     if conflicts:
         raise ValueError("迁移遇到文件类型冲突：" + ", ".join(conflicts))
     if ops:
@@ -478,6 +588,8 @@ def prepare(mode, model, directory):
         path.unlink()
     valid = claude.get("login", {}).get("state") == "valid"
     if mode != "switch" and valid:
+        share_config(Path(snapshot["global"]["data_dir"]) / "claude" / "accounts" /
+                     str(current["device_id"]), shared_items())
         return
     switching = mode == "switch"
     if switching and not current.get("device_id"):
@@ -539,6 +651,7 @@ def prepare(mode, model, directory):
             subprocess.run([REC, "org", "use", str(org)], check=True)
         if status()["claude"].get("login", {}).get("state") != "valid":
             raise ValueError("本机绑定还没就绪")
+        share_config(Path(snapshot["global"]["data_dir"]) / "claude" / "accounts" / str(target), shared_items())
         print("本机登录成功。设备归属由服务端同步。", file=sys.stderr)
 
 
