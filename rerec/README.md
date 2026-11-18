@@ -13,6 +13,8 @@ macOS、Linux 和 Windows 共用同一个单文件客户端。Windows 需要 Git
 
 ### 与普通 Claude Code 共用配置
 
-共享源是本机的 `~/.claude/`。启动、登录或换号时，rerec 把账号里对应的条目链接到这里。默认共用 `CLAUDE.md`、`agents/`、`commands/`、`output-styles/`、`hooks/`、`scripts/`、`handoff/`、`keybindings.json` 和各个自定义 skill。账号独有的文件会补到共享目录；同名内容不同用共享版，账号原件保存在该设备目录的 `.rerec-link-backup-*`。已有的用户自建链接保留。新建的 skill 在下次启动时接入；`skills/synced/` 留在各账号。项目记忆继续随历史复制，模型和代理设置沿用账号配置。链接 hooks 目录不会自动启用其中的脚本。
+共享源是本机的 `~/.claude/`。启动、登录或换号时，rerec 把账号里对应的条目链接到这里。默认共用 `CLAUDE.md`、`agents/`、`commands/`、`output-styles/`、`hooks/`、`scripts/`、`handoff/`、`keybindings.json` 和各个自定义 skill。账号独有的文件会补到共享目录；同名内容不同用共享版，账号原件保存在该设备目录的 `.rerec-link-backup-*`。已有的用户自建链接保留。新建的 skill 在下次启动时接入；`skills/synced/` 留在各账号。项目记忆继续随历史复制。
+
+启动和登录时，从 `~/.claude/settings.json` 复制共享设置。换号时先叠加旧账号的共享字段，再叠加普通 Claude 的共享字段。同名顶层字段整项替换，只在目标账号存在的字段保留。`env`、`apiKeyHelper`、`awsAuthRefresh`、`awsCredentialExport`、`gcpAuthRefresh`、`forceLoginMethod`、`forceLoginOrgUUID` 和 `modelOverrides` 始终取目标账号自己的值。其余字段都参与复制，包括 hooks 触发规则和权限偏好。
 
 可在 `~/.config/rerec/migration.json` 通过 `links` 数组选择上述条目，例如 `{"links":["CLAUDE.md","skills"]}`。省略该字段采用默认清单。移出清单后，该账号下次启动会把原受管链接还原为独立副本。关闭 skills 共享时，换号沿用原来的 skills 复制逻辑。Windows 创建符号链接需要启用“开发人员模式”或具备创建符号链接的权限。

@@ -154,6 +154,14 @@ def test_bash_switch_migrates_and_launches(tmp_path, bot, monkeypatch):
     (source / "config/history.jsonl").write_text("a session\n")
     shared = tmp_path / ".claude"
     shared.mkdir()
+    shared_settings = {"env": {"ANTHROPIC_MODEL": "global"}, "hooks": {"SessionStart": []},
+                       "modelOverrides": {"opus": "global"}, "forceLoginOrgUUID": "global",
+                       "permissions": {"ask": ["Read"]}, "futureSetting": True}
+    (shared / "settings.json").write_text(json.dumps(shared_settings))
+    (source / "config/settings.json").write_text(json.dumps({
+        "sourceOnly": 1, "env": {"other": "source"}, "futureSetting": False, "apiKeyHelper": "source"}))
+    target_settings = {"env": {"HTTPS_PROXY": "target"}, "apiKeyHelper": "target", "targetOnly": 2}
+    (target / "config/settings.json").write_text(json.dumps(target_settings))
     (shared / "CLAUDE.md").write_text("common")
     (source / "config/CLAUDE.md").write_text("old rules")
     for name in ("mine", "synced"):
@@ -214,6 +222,11 @@ else:sys.exit(2)
     )
     try:
         subprocess.run([ROOT / "rerec/rerec", "switch", "fable"], env=env, check=True, timeout=15)
+        expected = {**target_settings, "sourceOnly": 1, "hooks": {"SessionStart": []},
+                    "permissions": {"ask": ["Read"]}, "futureSetting": True}
+        assert json.loads((target / "config/settings.json").read_text()) == expected
+        shared_settings["futureSetting"] = "updated"
+        (shared / "settings.json").write_text(json.dumps(shared_settings))
         for account in (source, target):
             assert (account / "config/CLAUDE.md").readlink() == shared / "CLAUDE.md"
             assert (account / "config/skills/mine").readlink() == shared / "skills/mine"
@@ -223,6 +236,7 @@ else:sys.exit(2)
         assert (target / "config" / memory / "MEMORY.md").read_text() == "project"
         (config / "migration.json").write_text(json.dumps({"links": ["skills"]}))
         subprocess.run([ROOT / "rerec/rerec", "login"],env=env,check=True)
+        assert json.loads((target / "config/settings.json").read_text()) == dict(expected, futureSetting="updated")
         assert not (target / "config/CLAUDE.md").is_symlink()
         assert (target / "config/CLAUDE.md").read_text() == "common"
         assert (target / "config/history.jsonl").read_text() == "a session\n"

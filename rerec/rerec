@@ -59,8 +59,19 @@ JOB_FIELDS = frozenset('''state detail template intent displayIntent name nameSo
 color sessionId resumeSessionId cwd originCwd createdAt updatedAt firstTerminalAt
 lastTerminalAt output children tokens interactiveLineage worktreePath worktreeBranch
 forkSessionId forkParentSessionId group pinned sortOrder stateSortOrder'''.split())
-SETTINGS = ('attribution', 'includeCoAuthoredBy', 'theme', 'modelSettings', 'model',
-            'enabledPlugins', 'extraKnownMarketplaces')
+ACCOUNT_SETTINGS = {
+    'env', 'apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'gcpAuthRefresh',
+    'forceLoginMethod', 'forceLoginOrgUUID', 'modelOverrides',
+}
+
+
+def merged_settings(target, *sources):
+    original = read_object(target)
+    result = original.copy()
+    for path in sources:
+        result.update((k, v) for k, v in read_object(path).items() if k not in ACCOUNT_SETTINGS)
+    return result if result != original else None
+
 
 
 def revision(path):
@@ -197,7 +208,16 @@ def share_config(account, items):
         print(f"共享配置同名内容不同，账号原件保存在 {backup}", file=sys.stderr)
 
 
-def plan(source, target, include_hooks=False, *, trees=TREES):
+def prepare_account(snapshot, device):
+    account = Path(snapshot["global"]["data_dir"]) / "claude" / "accounts" / str(device)
+    share_config(account, shared_items())
+    target = safe_path(account, Path("config/settings.json"))
+    merged = merged_settings(target, Path.home() / ".claude/settings.json")
+    if merged is not None:
+        write_json(target, merged)
+
+
+def plan(source, target, *, trees=TREES):
     # Resolve neither symlinks nor identical/nested directories silently.
     for root in (source, target):
         if not root.is_absolute() or not root.is_dir() or any(linked(p) for p in (root, *root.parents)):
@@ -268,17 +288,10 @@ def plan(source, target, include_hooks=False, *, trees=TREES):
             operations.append((history, None, data, None, revision(new) if new.exists() else None))
     settings = Path('settings.json')
     old, new = safe_path(src, settings), safe_path(dst, settings)
-    if old.exists():
-        source_settings, target_settings = read_object(old), read_object(new)
-        selected = {k: v for k, v in source_settings.items() if k in SETTINGS}
-        # Hooks execute local commands. Explicit opt-in; paths are never rewritten.
-        if include_hooks and 'hooks' in source_settings:
-            selected['hooks'] = source_settings['hooks']
-        merged = dict(target_settings)
-        merged.update(selected)
-        if merged != target_settings:
-            data = (json.dumps(merged, ensure_ascii=False, indent=2) + '\n').encode()
-            operations.append((settings, None, data, None, revision(new) if new.exists() else None))
+    merged = merged_settings(new, old, Path.home() / ".claude/settings.json")
+    if merged is not None:
+        data = (json.dumps(merged, ensure_ascii=False, indent=2) + '\n').encode()
+        operations.append((settings, None, data, None, revision(new) if new.exists() else None))
     config = Path('.claude.json')
     old, new = safe_path(src, config), safe_path(dst, config)
     if old.exists():
@@ -588,8 +601,7 @@ def prepare(mode, model, directory):
         path.unlink()
     valid = claude.get("login", {}).get("state") == "valid"
     if mode != "switch" and valid:
-        share_config(Path(snapshot["global"]["data_dir"]) / "claude" / "accounts" /
-                     str(current["device_id"]), shared_items())
+        prepare_account(snapshot, current["device_id"])
         return
     switching = mode == "switch"
     if switching and not current.get("device_id"):
@@ -651,7 +663,7 @@ def prepare(mode, model, directory):
             subprocess.run([REC, "org", "use", str(org)], check=True)
         if status()["claude"].get("login", {}).get("state") != "valid":
             raise ValueError("本机绑定还没就绪")
-        share_config(Path(snapshot["global"]["data_dir"]) / "claude" / "accounts" / str(target), shared_items())
+        prepare_account(snapshot, target)
         print("本机登录成功。设备归属由服务端同步。", file=sys.stderr)
 
 
