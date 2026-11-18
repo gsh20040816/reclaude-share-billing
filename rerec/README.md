@@ -1,6 +1,6 @@
 # rerec
 
-macOS 和 Linux 客户端需要 Bash、Python 3.10+ 和已安装的官方 reclaude。按[仓库首页的安装命令](../README.md#安装-rerec-客户端)装到 `~/.local/bin/rerec`。也可以把本目录里的单文件 `rerec` 复制到 PATH 中并赋予执行权限。服务端沿用本仓库 Bot 的 Python 环境。
+macOS、Linux 和 Windows 共用同一个单文件客户端。Windows 需要 Git Bash、Windows 版 Python 3.10+ 和可从 Git Bash 启动的官方 reclaude。按[仓库首页的安装命令](../README.md#安装-rerec-客户端)装到 `~/.local/bin/rerec`。也可以把本目录里的单文件 `rerec` 复制到 PATH 中并赋予执行权限。服务端沿用本仓库 Bot 的 Python 环境。
 
 管理员在 Bot 配置中加 `"rerec_port": 8187`，重启 Bot，把 `https://rerec.shgao.dev/` 反向代理到 `http://127.0.0.1:8187/`。实际授权和释放席位需要已有配置 `dry_run=false`。Bot 进程处理 Telegram 和 HTTP 两个入口的写请求，共用写队列、会话池和 SQLite。不要另外启动一份 Bot。
 

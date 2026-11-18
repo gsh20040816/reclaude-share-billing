@@ -3,10 +3,17 @@ set -euo pipefail
 
 install_rerec() {
   case $(uname -s) in
-    Darwin|Linux) ;;
-    *) echo 'rerec 支持 macOS 和 Linux。' >&2; return 1 ;;
+    Darwin|Linux) python=(python3) ;;
+    MINGW*|MSYS*)
+      python=(python3)
+      if py -3 -c 'import sys;sys.exit(sys.version_info < (3,10))' >/dev/null 2>&1; then
+        python=(py -3)
+      elif python -c 'import sys;sys.exit(sys.version_info < (3,10))' >/dev/null 2>&1; then
+        python=(python)
+      fi ;;
+    *) echo 'rerec 支持 macOS、Linux 和 Windows Git Bash。' >&2; return 1 ;;
   esac
-  if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+  if ! "${python[@]}" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
     echo '请先安装 Python 3.10 或更高版本。' >&2
     return 1
   fi

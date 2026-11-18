@@ -16,7 +16,7 @@ evict the least-recently-used device when slots run out, split the account cost 
 
 ## 安装 rerec 客户端
 
-macOS 和 Linux 用同一条命令，Intel 和 ARM 通用。先准备好 Bash、Python 3.10+ 和官方 `reclaude`，再安装或更新：
+macOS、Linux 和 Windows 用同一个可执行脚本。Windows 请在 **Git Bash** 里执行下面的命令。先准备好 Bash、Python 3.10+ 和官方 `reclaude`，再安装或更新：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gsh20040816/reclaude-share-billing/main/rerec/install.sh | bash

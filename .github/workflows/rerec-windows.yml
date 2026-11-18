@@ -1,0 +1,18 @@
+name: Windows Git Bash client
+on:
+  push:
+    paths: ['rerec/**', 'tests/windows_client.py', '.github/workflows/rerec-windows.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Exercise installed client in Git Bash
+        shell: bash
+        run: python -X utf8 tests/windows_client.py

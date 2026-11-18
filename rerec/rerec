@@ -1,12 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pass Python on fd 3 so interactive prompts can still read stdin.
+# Native Windows Python cannot open Git Bash's /dev/fd paths. Read the
+# embedded source from this executable and keep stdin attached to the terminal.
 client() {
-  python3 /dev/fd/3 "$@" 3<<'REREC_PYTHON'
+  local script=${BASH_SOURCE[0]}
+  local python=(python3)
+  case $(uname -s) in
+    MINGW*|MSYS*)
+      if py -3 -c 'import sys;sys.exit(sys.version_info < (3,10))' >/dev/null 2>&1; then
+        python=(py -3)
+      elif python -c 'import sys;sys.exit(sys.version_info < (3,10))' >/dev/null 2>&1; then
+        python=(python)
+      fi
+      script=$(cygpath -aw "$script")
+      export XDG_CONFIG_HOME=$(cygpath -aw "${XDG_CONFIG_HOME:-$HOME/.config}")
+      ;;
+  esac
+  "${python[@]}" -X utf8 -c '
+import pathlib, sys
+path = sys.argv.pop(1)
+source = pathlib.Path(path).read_bytes().replace(b"\r\n", b"\n")
+source = source.split(b"\n# BEGIN PYTHON\n", 1)[1].split(b"\n# END PYTHON\n", 1)[0]
+exec(compile(source, path, "exec"))
+' "$script" "$@"
+}
+
+: <<'REREC_PYTHON'
+# BEGIN PYTHON
 """Structured status, authorization handoff and local migration for the Bash CLI."""
 
-import getpass
+import stat
 import http.client
 import json
 import os
@@ -42,11 +66,20 @@ def revision(path):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def linked(path):
+    if os.name == "nt":
+        try:
+            return bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except FileNotFoundError:
+            return False
+    return path.is_symlink()
+
+
 def safe_path(root, relative):
     current = root
     for part in relative.parts:
         current = current / part
-        if current.is_symlink():
+        if linked(current):
             raise ValueError(f'Symlink is not allowed: {current}')
     return current
 
@@ -61,7 +94,7 @@ def read_object(path):
 def plan(source, target, include_hooks=False):
     # Resolve neither symlinks nor identical/nested directories silently.
     for root in (source, target):
-        if not root.is_dir() or root.is_symlink() or root.resolve() != root.absolute():
+        if not root.is_dir() or linked(root) or root.resolve() != root.absolute():
             raise ValueError(f'Expected real absolute device directory: {root}')
     if source == target or source in target.parents or target in source.parents:
         raise ValueError('Source and target must be distinct, non-nested directories')
@@ -77,13 +110,13 @@ def plan(source, target, include_hooks=False):
             folder = Path(directory)
             for name in list(dirs):
                 child = folder / name
-                if child.is_symlink() or (tree == 'skills' and child == base / 'synced'):
+                if linked(child) or (tree == 'skills' and child == base / 'synced'):
                     dirs.remove(name)
                     skipped.append(str(child.relative_to(src)))
             for name in sorted(files):
                 old = folder / name
                 rel = old.relative_to(src)
-                if old.is_symlink() or (tree == 'skills' and old == base / 'synced'):
+                if linked(old) or (tree == 'skills' and old == base / 'synced'):
                     skipped.append(str(rel))
                     continue
                 new = safe_path(dst, rel)
@@ -107,18 +140,18 @@ def plan(source, target, include_hooks=False):
             for name in list(dirs):
                 child = folder / name
                 rel = child.relative_to(dst)
-                if (child.is_symlink() or
+                if (linked(child) or
                     (tree == 'skills' and child == dest / 'synced') or
                     any(rel == Path(x) or Path(x) in rel.parents for x in skipped)):
                     dirs.remove(name)
             for name in sorted(files):
                 target_file = folder / name
                 rel = target_file.relative_to(dst)
-                if target_file.is_symlink() or (tree == 'skills' and target_file == dest / 'synced'):
+                if linked(target_file) or (tree == 'skills' and target_file == dest / 'synced'):
                     skipped.append(str(rel))
                     continue
                 source_file = src / rel
-                if not source_file.exists() and not source_file.is_symlink():
+                if not source_file.exists() and not linked(source_file):
                     operations.append((rel, None, None, None, revision(target_file)))
     history = Path('history.jsonl')
     old, new = safe_path(src, history), safe_path(dst, history)
@@ -272,7 +305,7 @@ def endpoint(url):
 def pair():
     url = os.environ.get("REREC_URL", "https://rerec.shgao.dev")
     endpoint(url)
-    token = getpass.getpass("私聊 Bot 发送 /rerec 后得到的密钥: ").strip()
+    token = sys.stdin.readline().strip()
     if not token:
         raise ValueError("密钥为空")
     CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -351,6 +384,33 @@ def processes():
 
 
 def stop_clients():
+    if os.name == "nt":
+        # GetOwnerSid also works for a non-elevated user. Scope shutdown to
+        # their native executables, including background Claude processes.
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", r"""
+$ErrorActionPreference = 'Stop'
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+function OwnedClients {
+    foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='reclaude.exe' OR Name='rec.exe'")) {
+        $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid
+        if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $sid) { $p }
+    }
+}
+foreach ($p in (OwnedClients)) {
+    $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+    if ($proc) { $null = $proc.CloseMainWindow() }
+}
+$until = [DateTime]::UtcNow.AddSeconds(5)
+while ((OwnedClients) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 200 }
+foreach ($p in (OwnedClients)) {
+    $result = Invoke-CimMethod -InputObject $p -MethodName Terminate
+    if ($result.ReturnValue -ne 0) { throw "Could not stop PID $($p.ProcessId)" }
+}
+$until = [DateTime]::UtcNow.AddSeconds(3)
+while ((OwnedClients) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 200 }
+if (OwnedClients) { throw 'Claude processes are still running' }
+"""], check=True)
+        return
     for sig, grace in [(signal.SIGTERM, 5), (signal.SIGKILL, 2)]:
         for pid in processes():
             try:
@@ -486,11 +546,20 @@ if __name__ == "__main__":
         if sys.argv[1] == "pair":
             pair()
         else:
-            prepare(*sys.argv[2:])
+            mode, model, directory = sys.argv[2:]
+            with (Path(directory) / "lock").open("a+b") as lock:
+                if os.name == "nt":
+                    import msvcrt
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                prepare(mode, model, directory)
     except (ValueError, OSError, subprocess.SubprocessError) as e:
         sys.exit(str(e))
+# END PYTHON
 REREC_PYTHON
-}
 
 rec=${REREC_REC:-reclaude}
 case ${1:-} in
@@ -498,14 +567,13 @@ case ${1:-} in
     echo 'rerec [Claude 参数...] | rerec pair | rerec login | rerec switch [模型]'
     exit ;;
   pair)
-    client pair; exit ;;
+    IFS= read -rs -p '私聊 Bot 发送 /rerec 后得到的密钥: ' token
+    printf '\n' >&2
+    client pair <<<"$token"; exit ;;
 esac
 umask 077
 state=${XDG_STATE_HOME:-"$HOME/.local/state"}/rerec
 mkdir -p "$state"
-exec 9>"$state/lock"
-# The shell owns fd 9 throughout preparation, including the Python children.
-python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'
 mode=start
 model=''
 case ${1:-} in
@@ -521,7 +589,6 @@ case ${1:-} in
   login) mode=login; shift ;;
 esac
 client prepare "$mode" "$model" "$state"
-exec 9>&-
 if [[ $mode != login ]]; then
   if [[ $mode == switch && -n $model && $model != other ]]; then
     exec "$rec" cli --model "$model" "$@"
