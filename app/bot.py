@@ -301,7 +301,9 @@ class Bot:
 
     def user_display_name(self, uid):
         person = self.conn.execute('SELECT handle FROM users WHERE tg_user_id=?', (uid,)).fetchone()
-        return person['handle'] if person and person['handle'] else f'tg:{uid}'
+        if person and person['handle']:
+            return person['handle'].lstrip('@').replace('@', '＠') or f'tg:{uid}'
+        return f'tg:{uid}'
 
     def _user_devices(self, uid):
         return self.conn.execute(

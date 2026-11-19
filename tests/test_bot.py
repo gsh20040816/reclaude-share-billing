@@ -59,6 +59,14 @@ def test_pair_reply_includes_configured_endpoint(bot):
     assert 'REREC_URL=https://rerec.example.test rerec pair' in bot.tg.sent[-1]
 
 
+def test_display_username_without_mention(bot):
+    bot.handle({"message": _msg(text="/help")})
+    assert bot.user_display_name(ADMIN) == "gsh"
+    bot.conn.execute("UPDATE users SET handle=? WHERE tg_user_id=?", ("昵称 @other_user", ADMIN))
+    assert bot.user_display_name(ADMIN) == "昵称 ＠other_user"
+    assert bot.user_display_name(-1) == "tg:-1"
+
+
 def test_help_and_accounts(bot):
     bot.command(_msg()["chat"], _msg(), ADMIN, "/help", None)
     bot.command(_msg()["chat"], _msg(), ADMIN, "/accounts", None)
