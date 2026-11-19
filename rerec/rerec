@@ -430,6 +430,7 @@ def pair():
         raise ValueError("密钥为空")
     CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     write_json(CONFIG, dict(url=url, token=token))
+    print(f"配对配置已保存，服务地址：{url}")
 
 
 def api(**body):

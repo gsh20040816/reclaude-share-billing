@@ -3,5 +3,6 @@
   "admin_ids": [2039687026],
   "allowed_chat_ids": [2039687026],
   "base_url": "https://www.reclaude.ai",
+  "rerec_public_url": "https://rerec.shgao.dev",
   "dry_run": true
 }

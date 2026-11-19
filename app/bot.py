@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import shlex
 import signal
 import threading
 import time
@@ -423,7 +424,11 @@ class Bot:
             self.tg.send(uid, '管理员还没启用 rerec 服务')
             return
         token = issue_token(self.conn, uid)
-        self.tg.send(uid, f'在本机跑 rerec pair，然后输入配对密钥：<code>{token}</code>。'
+        url = self.cfg.get('rerec_public_url', 'https://rerec.shgao.dev')
+        command = f'REREC_URL={shlex.quote(url)} rerec pair'
+        self.tg.send(uid, f'服务地址：<code>{esc(url)}</code>\n'
+                     f'在终端运行：<code>{esc(command)}</code>\n'
+                     f'提示输入密钥时粘贴：<code>{token}</code>\n'
                      '私聊 /rerec reset 可撤销你的全部密钥。')
 
     def cmd_login(self, chat, msg, uid, args, thread) -> None:

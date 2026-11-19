@@ -52,6 +52,13 @@ def _msg(uid=ADMIN, text="/x"):
             "message_id": 7, "text": text}
 
 
+def test_pair_reply_includes_configured_endpoint(bot):
+    bot.cfg.update(rerec_port=8187, rerec_public_url='https://rerec.example.test')
+    bot.command(_msg()["chat"], _msg(), ADMIN, "/rerec", None)
+    assert '服务地址：<code>https://rerec.example.test</code>' in bot.tg.sent[-1]
+    assert 'REREC_URL=https://rerec.example.test rerec pair' in bot.tg.sent[-1]
+
+
 def test_help_and_accounts(bot):
     bot.command(_msg()["chat"], _msg(), ADMIN, "/help", None)
     bot.command(_msg()["chat"], _msg(), ADMIN, "/accounts", None)
