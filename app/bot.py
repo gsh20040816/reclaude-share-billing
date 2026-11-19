@@ -268,6 +268,7 @@ class Bot:
         lines = ["<b>ReClaude 合租</b>", "",
                  "<b>用户</b>",
                  "• <code>/login &lt;授权链接&gt; [账号]</code> 登记本机（reclaude login 打印的链接）",
+                 "• 私聊 <code>/rerec</code> 获取终端配对密钥，<code>/rerec reset</code> 撤销自己的全部配对",
                  "• <code>/me</code> 我的设备与本月账单",
 
                  "• <code>/bill [起] [止]</code> 我的账单明细",
